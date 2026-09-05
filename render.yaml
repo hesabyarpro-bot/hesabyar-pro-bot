@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hesabyar-pro-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.main
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 10000
