@@ -1,1613 +1,897 @@
-from __future__ import annotations
+import os
+import logging
+from datetime import datetime
 from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Update,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ConversationHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-from .db import get_conn
-from .sales import SalesService
-from .master_data import (
+from app.db import (
+    get_conn,
+    init_db,
     create_customer,
-    create_product,
-    deactivate_customer,
-    deactivate_product,
-    digits,
     get_customer,
-    get_product,
     list_customers,
-    list_products,
-    to_int,
     update_customer,
+    deactivate_customer,
+    activate_customer,
+    create_product,
+    get_product,
+    list_products,
     update_product,
+    deactivate_product,
+    activate_product,
 )
-# =========================================================
-# Conversation states
-# =========================================================
-(
-    CHOOSE_CUSTOMER,
-    CHOOSE_PRODUCT,
-    ENTER_QTY,
-    ENTER_PRICE,
-    ENTER_DISCOUNT,
-    CHOOSE_PAYMENT,
-    CONFIRM,
-) = range(7)
-(
-    C_NAME,
-    C_PHONE,
-    C_BALANCE,
-) = range(20, 23)
-(
-    P_SKU,
-    P_NAME,
-    P_SALE,
-    P_COST,
-    P_STOCK,
-) = range(30, 35)
-# =========================================================
-# Helpers
-# =========================================================
-def money(value) -> str:
-    return f"{int(value):,} ریال"
-def main_menu():
-    return InlineKeyboardMarkup(
+from app.sales import SalesService
+# ============================================================
+# Logging
+# ============================================================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+# ============================================================
+# تنظیمات
+# ============================================================
+ADMIN_ID = int(
+    os.getenv("ADMIN_ID", "8806709666")
+)
+# ============================================================
+# Keyboard اصلی
+# ============================================================
+def main_keyboard():
+    keyboard = [
         [
-            [
-                InlineKeyboardButton(
-                    "🛒 ثبت فروش",
-                    callback_data="sale:start",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧾 ثبت خرید",
-                    callback_data="coming:purchase",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 مشتریان",
-                    callback_data="customers:list",
-                ),
-                InlineKeyboardButton(
-                    "📦 کالاها",
-                    callback_data="products:list",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📊 گزارش‌ها",
-                    callback_data="coming:reports",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⚙️ تنظیمات",
-                    callback_data="coming:settings",
-                )
-            ],
-        ]
-    )
-def back_home_markup():
-    return InlineKeyboardMarkup(
+            "🛒 ثبت فروش",
+            "🧾 ثبت خرید",
+        ],
         [
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home",
-                )
-            ]
-        ]
+            "👥 مشتریان",
+            "📦 کالاها",
+        ],
+        [
+            "📊 گزارش‌ها",
+            "👨‍💼 پشتیبانی",
+        ],
+        [
+            "⚙️ تنظیمات",
+        ],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
     )
-# =========================================================
-# Start / Home
-# =========================================================
-async def start(
+# ============================================================
+# /start
+# ============================================================
+async def start_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
+    user = update.effective_user
+    logger.info(
+        "User started bot: %s",
+        user.id if user else None,
+    )
     await update.message.reply_text(
         "سلام 👋\n\n"
-        "به حساب‌یار پرو خوش آمدید.\n\n"
-        "🤖 دستیار مالی و حسابداری هوشمند شما آماده است.\n\n"
-        "از منوی زیر انتخاب کنید:",
-        reply_markup=main_menu(),
+        "به «حساب‌یار پرو» خوش آمدید.\n\n"
+        "حسابداری حرفه‌ای، ساده و همیشه در دسترس.",
+        reply_markup=main_keyboard(),
     )
-async def home(
+# ============================================================
+# منوی اصلی
+# ============================================================
+async def menu_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🏠 منوی اصلی حساب‌یار پرو",
-        reply_markup=main_menu(),
-    )
-async def coming(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🚧 این بخش در حال تکمیل است.\n\n"
-        "به‌زودی فعال می‌شود.",
-        reply_markup=back_home_markup(),
-    )
-# =========================================================
-# Customers
-# =========================================================
-async def customers_list(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        rows = list_customers(conn)
-    buttons = []
-    for row in rows[:30]:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"👤 {row['name']}",
-                    callback_data=f"customer:view:{row['id']}",
-                )
-            ]
-        )
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "➕ مشتری جدید",
-                callback_data="customer:add",
-            )
-        ]
-    )
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "🏠 منوی اصلی",
-                callback_data="home",
-            )
-        ]
-    )
-    if not rows:
-        text = (
-            "👥 مدیریت مشتریان\n\n"
-            "هنوز مشتری فعالی ثبت نشده است."
-        )
-    else:
-        text = (
-            "👥 مدیریت مشتریان\n\n"
-            f"تعداد مشتریان فعال: {len(rows)}\n\n"
-            "یک مشتری را انتخاب کنید:"
-        )
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-async def customer_view(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    customer_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        row = get_customer(
-            conn,
-            customer_id,
-        )
-    if not row:
-        await query.edit_message_text(
-            "❌ مشتری پیدا نشد.",
-            reply_markup=back_home_markup(),
+    text = update.message.text
+    if text == "🛒 ثبت فروش":
+        await sales_start(update, context)
+        return
+    if text == "🧾 ثبت خرید":
+        await update.message.reply_text(
+            "🧾 بخش ثبت خرید در حال تکمیل است.\n\n"
+            "این بخش در مرحله بعد به صورت کامل فعال می‌شود."
         )
         return
-    text = (
-        f"👤 {row['name']}\n\n"
-        f"☎️ تلفن: {row['phone'] or '-'}\n"
-        f"💰 مانده افتتاحیه: "
-        f"{money(row['opening_balance'])}\n"
-        f"📌 وضعیت: "
-        f"{'فعال' if row['active'] else 'غیرفعال'}"
-    )
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "✏️ ویرایش",
-                callback_data=f"customer:edit:{customer_id}",
-            ),
-            InlineKeyboardButton(
-                "🗑 غیرفعال",
-                callback_data=f"customer:deactivate:{customer_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "↩️ بازگشت",
-                callback_data="customers:list",
-            )
-        ],
-    ]
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-async def customer_add_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["new_customer"] = {}
-    await query.edit_message_text(
-        "👤 ثبت مشتری جدید\n\n"
-        "نام مشتری را وارد کنید:"
-    )
-    return C_NAME
-async def customer_add_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    name = update.message.text.strip()
-    if not name:
+    if text == "👥 مشتریان":
+        await customers_menu(update, context)
+        return
+    if text == "📦 کالاها":
+        await products_menu(update, context)
+        return
+    if text == "📊 گزارش‌ها":
+        await reports_menu(update, context)
+        return
+    if text == "👨‍💼 پشتیبانی":
         await update.message.reply_text(
-            "❌ نام نمی‌تواند خالی باشد.\n"
-            "لطفاً نام مشتری را وارد کنید:"
+            "👨‍💼 پشتیبانی حساب‌یار پرو\n\n"
+            "برای ارتباط با پشتیبانی، پیام خود را ارسال کنید."
         )
-        return C_NAME
-    context.user_data["new_customer"][
-        "name"
-    ] = name
+        return
+    if text == "⚙️ تنظیمات":
+        await settings_menu(update, context)
+        return
+    # --------------------------------------------------------
+    # حالت‌های داخلی مشتری
+    # --------------------------------------------------------
+    state = context.user_data.get("state")
+    if state:
+        handled = await handle_state(
+            update,
+            context,
+            state,
+        )
+        if handled:
+            return
     await update.message.reply_text(
-        "☎️ شماره تماس را وارد کنید.\n"
-        "اگر ندارد، فقط - بزنید:"
+        "لطفاً یکی از گزینه‌های منوی اصلی را انتخاب کنید.",
+        reply_markup=main_keyboard(),
     )
-    return C_PHONE
-async def customer_add_phone(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ============================================================
+# State Handler
+# ============================================================
+async def handle_state(
+    update,
+    context,
+    state,
 ):
-    phone = update.message.text.strip()
-    context.user_data["new_customer"][
-        "phone"
-    ] = "" if phone == "-" else phone
-    await update.message.reply_text(
-        "💰 مانده افتتاحیه را به ریال وارد کنید.\n"
-        "اگر ندارد، 0 وارد کنید:"
-    )
-    return C_BALANCE
-async def customer_add_balance(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        balance = to_int(
-            update.message.text,
-            0,
+    text = update.message.text
+    # --------------------------------------------------------
+    # افزودن مشتری
+    # --------------------------------------------------------
+    if state == "customer_add_name":
+        context.user_data["customer_name"] = text
+        context.user_data["state"] = "customer_add_phone"
+        await update.message.reply_text(
+            "📱 شماره تلفن مشتری را وارد کنید.\n"
+            "اگر ندارد، «-» بفرستید."
         )
-        data = context.user_data.pop(
-            "new_customer"
+        return True
+    if state == "customer_add_phone":
+        phone = "" if text == "-" else text
+        context.user_data["customer_phone"] = phone
+        context.user_data["state"] = "customer_add_address"
+        await update.message.reply_text(
+            "📍 آدرس مشتری را وارد کنید.\n"
+            "اگر ندارد، «-» بفرستید."
         )
-        with get_conn(
-            context.application.bot_data["db_path"]
-        ) as conn:
-            row = create_customer(
-                conn,
-                data["name"],
-                data["phone"],
-                balance,
+        return True
+    if state == "customer_add_address":
+        address = "" if text == "-" else text
+        context.user_data["customer_address"] = address
+        context.user_data["state"] = "customer_add_notes"
+        await update.message.reply_text(
+            "📝 توضیحات مشتری را وارد کنید.\n"
+            "اگر ندارد، «-» بفرستید."
+        )
+        return True
+    if state == "customer_add_notes":
+        notes = "" if text == "-" else text
+        name = context.user_data.get(
+            "customer_name",
+            ""
+        )
+        phone = context.user_data.get(
+            "customer_phone",
+            ""
+        )
+        address = context.user_data.get(
+            "customer_address",
+            ""
+        )
+        customer_id = create_customer(
+            name=name,
+            phone=phone,
+            address=address,
+            notes=notes,
+        )
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ مشتری با موفقیت ثبت شد.\n\n"
+            f"شناسه مشتری: {customer_id}\n"
+            f"نام: {name}",
+            reply_markup=main_keyboard(),
+        )
+        return True
+    # --------------------------------------------------------
+    # افزودن کالا
+    # --------------------------------------------------------
+    if state == "product_add_name":
+        context.user_data["product_name"] = text
+        context.user_data["state"] = "product_add_sku"
+        await update.message.reply_text(
+            "🔢 کد کالا / SKU را وارد کنید.\n"
+            "اگر ندارد، «-» بفرستید."
+        )
+        return True
+    if state == "product_add_sku":
+        sku = None if text == "-" else text
+        context.user_data["product_sku"] = sku
+        context.user_data["state"] = "product_add_unit"
+        await update.message.reply_text(
+            "📏 واحد کالا را وارد کنید.\n"
+            "مثلاً: عدد، کیلو، متر"
+        )
+        return True
+    if state == "product_add_unit":
+        context.user_data["product_unit"] = text
+        context.user_data["state"] = "product_add_sale_price"
+        await update.message.reply_text(
+            "💰 قیمت فروش را به تومان وارد کنید."
+        )
+        return True
+    if state == "product_add_sale_price":
+        try:
+            sale_price = int(
+                normalize_number(text)
             )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ قیمت نامعتبر است.\n"
+                "مثلاً 150000 وارد کنید."
+            )
+            return True
+        context.user_data["product_sale_price"] = sale_price
+        context.user_data["state"] = "product_add_purchase_cost"
         await update.message.reply_text(
-            "✅ مشتری با موفقیت ثبت شد.\n\n"
-            f"👤 {row['name']}\n"
-            f"☎️ {row['phone'] or '-'}\n"
-            f"💰 مانده افتتاحیه: "
-            f"{money(row['opening_balance'])}",
-            reply_markup=main_menu(),
+            "💵 قیمت خرید / بهای تمام‌شده فعلی را وارد کنید."
         )
-        return ConversationHandler.END
-    except ValueError:
+        return True
+    if state == "product_add_purchase_cost":
+        try:
+            purchase_cost = int(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ قیمت نامعتبر است."
+            )
+            return True
+        name = context.user_data.get(
+            "product_name",
+            ""
+        )
+        sku = context.user_data.get(
+            "product_sku"
+        )
+        unit = context.user_data.get(
+            "product_unit",
+            "عدد"
+        )
+        sale_price = context.user_data.get(
+            "product_sale_price",
+            0
+        )
+        try:
+            product_id = create_product(
+                name=name,
+                sku=sku,
+                unit=unit,
+                sale_price=sale_price,
+                purchase_cost=purchase_cost,
+                stock=0,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Product creation error"
+            )
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"❌ ثبت کالا انجام نشد.\n\n"
+                f"علت: {exc}",
+                reply_markup=main_keyboard(),
+            )
+            return True
+        context.user_data.clear()
         await update.message.reply_text(
-            "❌ مبلغ نامعتبر است.\n"
-            "فقط عدد وارد کنید؛ مثال:\n"
-            "5000000"
+            f"✅ کالا با موفقیت ثبت شد.\n\n"
+            f"شناسه: {product_id}\n"
+            f"نام: {name}\n"
+            f"کد: {sku or '-'}\n"
+            f"واحد: {unit}\n"
+            f"قیمت فروش: {sale_price:,}\n"
+            f"بهای خرید: {purchase_cost:,}",
+            reply_markup=main_keyboard(),
         )
-        return C_BALANCE
-    except Exception as exc:
+        return True
+    # --------------------------------------------------------
+    # فروش
+    # --------------------------------------------------------
+    if state == "sale_customer":
+        try:
+            customer_id = int(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ شناسه مشتری نامعتبر است."
+            )
+            return True
+        customer = get_customer(
+            customer_id
+        )
+        if not customer or not customer["active"]:
+            await update.message.reply_text(
+                "❌ مشتری پیدا نشد."
+            )
+            return True
+        context.user_data["sale_customer_id"] = customer_id
+        context.user_data["state"] = "sale_product"
         await update.message.reply_text(
-            f"❌ ثبت مشتری انجام نشد:\n{exc}"
+            "📦 شناسه کالا را وارد کنید."
         )
-        return C_BALANCE
-async def customer_edit_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    customer_id = int(
-        query.data.split(":")[-1]
+        return True
+    if state == "sale_product":
+        try:
+            product_id = int(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ شناسه کالا نامعتبر است."
+            )
+            return True
+        product = get_product(
+            product_id
+        )
+        if not product or not product["active"]:
+            await update.message.reply_text(
+                "❌ کالا پیدا نشد."
+            )
+            return True
+        context.user_data["sale_product_id"] = product_id
+        context.user_data["state"] = "sale_quantity"
+        await update.message.reply_text(
+            f"📦 کالا: {product['name']}\n"
+            f"موجودی: {float(product['stock'] or 0):g}\n\n"
+            f"تعداد فروش را وارد کنید."
+        )
+        return True
+    if state == "sale_quantity":
+        try:
+            quantity = float(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ تعداد نامعتبر است."
+            )
+            return True
+        if quantity <= 0:
+            await update.message.reply_text(
+                "❌ تعداد باید بیشتر از صفر باشد."
+            )
+            return True
+        context.user_data["sale_quantity"] = quantity
+        context.user_data["state"] = "sale_price"
+        product = get_product(
+            context.user_data["sale_product_id"]
+        )
+        await update.message.reply_text(
+            f"💰 قیمت فروش فعلی کالا: "
+            f"{int(product['sale_price'] or 0):,}\n\n"
+            f"قیمت فروش واحد را وارد کنید:"
+        )
+        return True
+    if state == "sale_price":
+        try:
+            price = int(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ قیمت نامعتبر است."
+            )
+            return True
+        if price < 0:
+            await update.message.reply_text(
+                "❌ قیمت نمی‌تواند منفی باشد."
+            )
+            return True
+        context.user_data["sale_price"] = price
+        context.user_data["state"] = "sale_discount"
+        await update.message.reply_text(
+            "🏷️ مبلغ تخفیف را وارد کنید.\n"
+            "اگر تخفیف ندارید، 0 بفرستید."
+        )
+        return True
+    if state == "sale_discount":
+        try:
+            discount = int(
+                normalize_number(text)
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ مبلغ تخفیف نامعتبر است."
+            )
+            return True
+        if discount < 0:
+            discount = 0
+        context.user_data["sale_discount"] = discount
+        context.user_data["state"] = "sale_payment"
+        await update.message.reply_text(
+            "💳 روش پرداخت را وارد کنید:\n\n"
+            "1️⃣ نقدی\n"
+            "2️⃣ بانکی\n"
+            "3️⃣ نسیه"
+        )
+        return True
+    if state == "sale_payment":
+        payment_map = {
+            "1": "cash",
+            "نقد": "cash",
+            "نقدی": "cash",
+            "2": "bank",
+            "بانک": "bank",
+            "بانکی": "bank",
+            "3": "credit",
+            "نسیه": "credit",
+        }
+        payment = payment_map.get(
+            text.strip().lower()
+        )
+        if not payment:
+            await update.message.reply_text(
+                "❌ روش پرداخت نامعتبر است.\n\n"
+                "1️⃣ نقدی\n"
+                "2️⃣ بانکی\n"
+                "3️⃣ نسیه"
+            )
+            return True
+        context.user_data["sale_payment"] = payment
+        await show_sale_preview(
+            update,
+            context
+        )
+        return True
+    if state == "sale_confirm":
+        answer = text.strip().lower()
+        if answer not in [
+            "بله",
+            "خیر",
+            "yes",
+            "no",
+            "y",
+            "n",
+        ]:
+            await update.message.reply_text(
+                "لطفاً «بله» یا «خیر» وارد کنید."
+            )
+            return True
+        if answer in ["خیر", "no", "n"]:
+            context.user_data.clear()
+            await update.message.reply_text(
+                "❌ ثبت فروش لغو شد.",
+                reply_markup=main_keyboard(),
+            )
+            return True
+        try:
+            service = SalesService()
+            result = service.create_sale(
+                customer_id=context.user_data.get(
+                    "sale_customer_id"
+                ),
+                product_id=context.user_data.get(
+                    "sale_product_id"
+                ),
+                quantity=context.user_data.get(
+                    "sale_quantity"
+                ),
+                unit_price=context.user_data.get(
+                    "sale_price"
+                ),
+                discount=context.user_data.get(
+                    "sale_discount",
+                    0
+                ),
+                tax=0,
+                payment_method=context.user_data.get(
+                    "sale_payment",
+                    "cash"
+                ),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Sale registration error"
+            )
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"❌ ثبت فروش انجام نشد.\n\n"
+                f"علت: {exc}",
+                reply_markup=main_keyboard(),
+            )
+            return True
+        context.user_data.clear()
+        await update.message.reply_text(
+            "✅ فروش با موفقیت ثبت شد.\n\n"
+            f"🧾 شماره فاکتور: {result['invoice_no']}\n"
+            f"💰 مبلغ: {result['payable_amount']:,} تومان\n"
+            f"🏷️ تخفیف: {result['discount_amount']:,} تومان\n"
+            f"💳 روش پرداخت: "
+            f"{payment_method_fa(result['payment_method'])}\n"
+            f"📦 بهای تمام‌شده: "
+            f"{result['cogs']:,} تومان",
+            reply_markup=main_keyboard(),
+        )
+        return True
+    return False
+# ============================================================
+# نرمال‌سازی اعداد
+# ============================================================
+def normalize_number(value):
+    translation = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789"
     )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        row = get_customer(
-            conn,
-            customer_id,
-        )
-    if not row:
-        await query.edit_message_text(
-            "❌ مشتری پیدا نشد.",
-            reply_markup=back_home_markup(),
-        )
-        return ConversationHandler.END
-    context.user_data[
-        "edit_customer"
-    ] = {
-        "id": customer_id,
-        "name": row["name"],
-        "phone": row["phone"] or "",
-        "balance": row["opening_balance"],
+    return (
+        str(value)
+        .translate(translation)
+        .replace(",", "")
+        .replace("٬", "")
+        .replace(" ", "")
+        .strip()
+    )
+def payment_method_fa(value):
+    mapping = {
+        "cash": "نقدی",
+        "bank": "بانکی",
+        "credit": "نسیه",
     }
-    await query.edit_message_text(
-        "✏️ ویرایش مشتری\n\n"
-        f"نام فعلی: {row['name']}\n\n"
-        "نام جدید را وارد کنید:"
+    return mapping.get(
+        value,
+        value
     )
-    return C_NAME
-async def customer_edit_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ============================================================
+# مشتریان
+# ============================================================
+async def customers_menu(
+    update,
+    context
 ):
-    name = update.message.text.strip()
-    if not name:
+    customers = list_customers(
+        active_only=True
+    )
+    if not customers:
         await update.message.reply_text(
-            "❌ نام نمی‌تواند خالی باشد."
-        )
-        return C_NAME
-    data = context.user_data[
-        "edit_customer"
-    ]
-    data["name"] = name
-    await update.message.reply_text(
-        "☎️ شماره جدید را وارد کنید.\n"
-        f"فعلی: {data['phone'] or '-'}"
-    )
-    return C_PHONE
-async def customer_edit_phone(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    data = context.user_data[
-        "edit_customer"
-    ]
-    phone = update.message.text.strip()
-    data["phone"] = (
-        ""
-        if phone == "-"
-        else phone
-    )
-    await update.message.reply_text(
-        "💰 مانده افتتاحیه جدید را وارد کنید.\n"
-        f"فعلی: {money(data['balance'])}"
-    )
-    return C_BALANCE
-async def customer_edit_balance(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        balance = to_int(
-            update.message.text,
-            0,
-        )
-        data = context.user_data.pop(
-            "edit_customer"
-        )
-        with get_conn(
-            context.application.bot_data["db_path"]
-        ) as conn:
-            row = update_customer(
-                conn,
-                data["id"],
-                data["name"],
-                data["phone"],
-                balance,
-            )
-        await update.message.reply_text(
-            "✅ مشتری با موفقیت ویرایش شد.\n\n"
-            f"👤 {row['name']}\n"
-            f"☎️ {row['phone'] or '-'}\n"
-            f"💰 مانده افتتاحیه: "
-            f"{money(row['opening_balance'])}",
-            reply_markup=main_menu(),
-        )
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text(
-            "❌ مبلغ نامعتبر است."
-        )
-        return C_BALANCE
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ ویرایش انجام نشد:\n{exc}"
-        )
-        return C_BALANCE
-async def customer_deactivate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    customer_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        deactivate_customer(
-            conn,
-            customer_id,
-        )
-    await query.edit_message_text(
-        "✅ مشتری غیرفعال شد.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "👥 مشتریان",
-                        callback_data="customers:list",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 منوی اصلی",
-                        callback_data="home",
-                    )
-                ],
-            ]
-        ),
-    )
-# =========================================================
-# Products
-# =========================================================
-async def products_list(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        rows = list_products(conn)
-    buttons = []
-    for row in rows[:30]:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"📦 {row['name']} | "
-                    f"موجودی {row['stock_qty']:g}",
-                    callback_data=f"product:view:{row['id']}",
-                )
-            ]
-        )
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "➕ کالای جدید",
-                callback_data="product:add",
-            )
-        ]
-    )
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "🏠 منوی اصلی",
-                callback_data="home",
-            )
-        ]
-    )
-    if not rows:
-        text = (
-            "📦 مدیریت کالاها\n\n"
-            "هنوز کالای فعالی ثبت نشده است."
+            "👥 هنوز مشتری فعالی ثبت نشده است."
         )
     else:
-        text = (
-            "📦 مدیریت کالاها\n\n"
-            f"تعداد کالاهای فعال: {len(rows)}\n\n"
-            "یک کالا را انتخاب کنید:"
-        )
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-async def product_view(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    product_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        row = get_product(
-            conn,
-            product_id,
-        )
-    if not row:
-        await query.edit_message_text(
-            "❌ کالا پیدا نشد.",
-            reply_markup=back_home_markup(),
-        )
-        return
-    text = (
-        f"📦 {row['name']}\n\n"
-        f"🏷 کد کالا: {row['sku'] or '-'}\n"
-        f"💰 قیمت فروش: {money(row['sale_price'])}\n"
-        f"🛒 بهای خرید: {money(row['purchase_cost'])}\n"
-        f"📊 موجودی: {row['stock_qty']:g}\n"
-        f"📌 وضعیت: "
-        f"{'فعال' if row['active'] else 'غیرفعال'}"
-    )
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "✏️ ویرایش",
-                callback_data=f"product:edit:{product_id}",
-            ),
-            InlineKeyboardButton(
-                "🗑 غیرفعال",
-                callback_data=f"product:deactivate:{product_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "↩️ بازگشت",
-                callback_data="products:list",
+        lines = [
+            "👥 مشتریان فعال:",
+            "",
+        ]
+        for customer in customers[:30]:
+            lines.append(
+                f"#{customer['id']} - "
+                f"{customer['name']}"
             )
-        ],
-    ]
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
+            if customer["phone"]:
+                lines.append(
+                    f"📱 {customer['phone']}"
+                )
+        await update.message.reply_text(
+            "\n".join(lines)
+        )
+    await update.message.reply_text(
+        "برای افزودن مشتری جدید، بنویسید:\n"
+        "➕ مشتری جدید"
     )
-async def product_add_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ============================================================
+# شروع افزودن مشتری
+# ============================================================
+async def customer_new(
+    update,
+    context
 ):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["new_product"] = {}
-    await query.edit_message_text(
-        "📦 ثبت کالای جدید\n\n"
-        "🏷 کد کالا را وارد کنید.\n"
-        "اگر کد ندارد، - بزنید:"
+    context.user_data.clear()
+    context.user_data["state"] = "customer_add_name"
+    await update.message.reply_text(
+        "👤 نام مشتری را وارد کنید:"
     )
-    return P_SKU
-async def product_add_sku(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ============================================================
+# کالاها
+# ============================================================
+async def products_menu(
+    update,
+    context
 ):
-    sku = update.message.text.strip()
-    context.user_data[
-        "new_product"
-    ]["sku"] = (
-        ""
-        if sku == "-"
-        else sku
+    products = list_products(
+        active_only=True
     )
+    if not products:
+        await update.message.reply_text(
+            "📦 هنوز کالای فعالی ثبت نشده است."
+        )
+    else:
+        lines = [
+            "📦 کالاهای فعال:",
+            "",
+        ]
+        for product in products[:30]:
+            lines.append(
+                f"#{product['id']} - "
+                f"{product['name']}"
+            )
+            lines.append(
+                f"💰 فروش: "
+                f"{int(product['sale_price'] or 0):,}"
+            )
+            lines.append(
+                f"📦 موجودی: "
+                f"{float(product['stock'] or 0):g}"
+            )
+            lines.append("")
+        await update.message.reply_text(
+            "\n".join(lines)
+        )
+    await update.message.reply_text(
+        "برای افزودن کالا جدید، بنویسید:\n"
+        "➕ کالای جدید"
+    )
+# ============================================================
+# شروع افزودن کالا
+# ============================================================
+async def product_new(
+    update,
+    context
+):
+    context.user_data.clear()
+    context.user_data["state"] = "product_add_name"
     await update.message.reply_text(
         "📦 نام کالا را وارد کنید:"
     )
-    return P_NAME
-async def product_add_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ============================================================
+# فروش
+# ============================================================
+async def sales_start(
+    update,
+    context
 ):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text(
-            "❌ نام کالا الزامی است."
-        )
-        return P_NAME
-    context.user_data[
-        "new_product"
-    ]["name"] = name
-    await update.message.reply_text(
-        "💰 قیمت فروش را به ریال وارد کنید:"
+    context.user_data.clear()
+    customers = list_customers(
+        active_only=True
     )
-    return P_SALE
-async def product_add_sale(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        sale = to_int(
-            update.message.text,
-            0,
-        )
-        context.user_data[
-            "new_product"
-        ]["sale"] = sale
+    if not customers:
         await update.message.reply_text(
-            "🛒 بهای خرید را به ریال وارد کنید:"
+            "❌ ابتدا حداقل یک مشتری ثبت کنید."
         )
-        return P_COST
-    except ValueError:
-        await update.message.reply_text(
-            "❌ قیمت نامعتبر است.\n"
-            "مثال: 25000000"
-        )
-        return P_SALE
-async def product_add_cost(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        cost = to_int(
-            update.message.text,
-            0,
-        )
-        context.user_data[
-            "new_product"
-        ]["cost"] = cost
-        await update.message.reply_text(
-            "📊 موجودی اولیه را وارد کنید.\n"
-            "مثال: 10 یا 2.5"
-        )
-        return P_STOCK
-    except ValueError:
-        await update.message.reply_text(
-            "❌ بهای خرید نامعتبر است."
-        )
-        return P_COST
-async def product_add_stock(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        stock_text = digits(
-            update.message.text
-        )
-        stock_text = (
-            stock_text
-            .replace(",", "")
-            .replace("٬", "")
-            .strip()
-        )
-        stock = float(stock_text)
-        if stock < 0:
-            raise ValueError
-        data = context.user_data.pop(
-            "new_product"
-        )
-        with get_conn(
-            context.application.bot_data["db_path"]
-        ) as conn:
-            row = create_product(
-                conn,
-                data["sku"],
-                data["name"],
-                data["sale"],
-                data["cost"],
-                stock,
-            )
-        await update.message.reply_text(
-            "✅ کالا با موفقیت ثبت شد.\n\n"
-            f"📦 {row['name']}\n"
-            f"🏷 کد: {row['sku'] or '-'}\n"
-            f"💰 فروش: {money(row['sale_price'])}\n"
-            f"🛒 خرید: {money(row['purchase_cost'])}\n"
-            f"📊 موجودی: {row['stock_qty']:g}",
-            reply_markup=main_menu(),
-        )
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text(
-            "❌ موجودی نامعتبر است.\n"
-            "مثال: 10 یا 2.5"
-        )
-        return P_STOCK
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ ثبت کالا انجام نشد:\n{exc}"
-        )
-        return P_STOCK
-async def product_edit_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    product_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        row = get_product(
-            conn,
-            product_id,
-        )
-    if not row:
-        await query.edit_message_text(
-            "❌ کالا پیدا نشد.",
-            reply_markup=back_home_markup(),
-        )
-        return ConversationHandler.END
-    context.user_data[
-        "edit_product"
-    ] = {
-        "id": product_id,
-        "sku": row["sku"] or "",
-        "name": row["name"],
-        "sale": row["sale_price"],
-        "cost": row["purchase_cost"],
-    }
-    await query.edit_message_text(
-        "✏️ ویرایش کالا\n\n"
-        f"کد فعلی: {row['sku'] or '-'}\n\n"
-        "کد جدید را وارد کنید:"
-    )
-    return P_SKU
-async def product_edit_sku(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    data = context.user_data[
-        "edit_product"
+        return
+    context.user_data["state"] = "sale_customer"
+    lines = [
+        "🛒 ثبت فروش",
+        "",
+        "شناسه مشتری را وارد کنید:",
+        "",
     ]
-    sku = update.message.text.strip()
-    data["sku"] = (
-        ""
-        if sku == "-"
-        else sku
+    for customer in customers[:20]:
+        lines.append(
+            f"#{customer['id']} - "
+            f"{customer['name']}"
+        )
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+async def show_sale_preview(
+    update,
+    context
+):
+    customer = get_customer(
+        context.user_data.get(
+            "sale_customer_id"
+        )
+    )
+    product = get_product(
+        context.user_data.get(
+            "sale_product_id"
+        )
+    )
+    quantity = context.user_data.get(
+        "sale_quantity",
+        0
+    )
+    price = context.user_data.get(
+        "sale_price",
+        0
+    )
+    discount = context.user_data.get(
+        "sale_discount",
+        0
+    )
+    payment = context.user_data.get(
+        "sale_payment",
+        "cash"
+    )
+    gross = int(
+        round(quantity * price)
+    )
+    net = max(
+        gross - discount,
+        0
     )
     await update.message.reply_text(
-        "📦 نام جدید را وارد کنید.\n"
-        f"فعلی: {data['name']}"
-    )
-    return P_NAME
-async def product_edit_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text(
-            "❌ نام کالا الزامی است."
-        )
-        return P_NAME
-    data = context.user_data[
-        "edit_product"
-    ]
-    data["name"] = name
-    await update.message.reply_text(
-        "💰 قیمت فروش جدید را وارد کنید.\n"
-        f"فعلی: {money(data['sale'])}"
-    )
-    return P_SALE
-async def product_edit_sale(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        sale = to_int(
-            update.message.text,
-            0,
-        )
-        data = context.user_data[
-            "edit_product"
-        ]
-        data["sale"] = sale
-        await update.message.reply_text(
-            "🛒 بهای خرید جدید را وارد کنید.\n"
-            f"فعلی: {money(data['cost'])}"
-        )
-        return P_COST
-    except ValueError:
-        await update.message.reply_text(
-            "❌ قیمت نامعتبر است."
-        )
-        return P_SALE
-async def product_edit_cost(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        cost = to_int(
-            update.message.text,
-            0,
-        )
-        data = context.user_data.pop(
-            "edit_product"
-        )
-        data["cost"] = cost
-        with get_conn(
-            context.application.bot_data["db_path"]
-        ) as conn:
-            row = update_product(
-                conn,
-                data["id"],
-                data["sku"],
-                data["name"],
-                data["sale"],
-                data["cost"],
-            )
-        await update.message.reply_text(
-            "✅ کالا با موفقیت ویرایش شد.\n\n"
-            f"📦 {row['name']}\n"
-            f"🏷 کد: {row['sku'] or '-'}\n"
-            f"💰 فروش: {money(row['sale_price'])}\n"
-            f"🛒 خرید: {money(row['purchase_cost'])}\n"
-            f"📊 موجودی: {row['stock_qty']:g}",
-            reply_markup=main_menu(),
-        )
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text(
-            "❌ بهای خرید نامعتبر است."
-        )
-        return P_COST
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ ویرایش کالا انجام نشد:\n{exc}"
-        )
-        return P_COST
-async def product_deactivate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    product_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        deactivate_product(
-            conn,
-            product_id,
-        )
-    await query.edit_message_text(
-        "✅ کالا غیرفعال شد.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📦 کالاها",
-                        callback_data="products:list",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 منوی اصلی",
-                        callback_data="home",
-                    )
-                ],
-            ]
-        ),
-    )
-# =========================================================
-# Sales
-# =========================================================
-async def sale_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["sale"] = {}
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        customers = SalesService(
-            conn
-        ).list_customers()
-    buttons = [
-        [
-            InlineKeyboardButton(
-                customer["name"],
-                callback_data=f"sale:customer:{customer['id']}",
-            )
-        ]
-        for customer in customers
-    ]
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="sale:cancel",
-            )
-        ]
-    )
-    await query.edit_message_text(
-        "🛒 ثبت فروش\n\n"
-        "👤 مشتری را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        ),
-    )
-    return CHOOSE_CUSTOMER
-async def choose_customer(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    customer_id = int(
-        query.data.split(":")[-1]
-    )
-    context.user_data[
-        "sale"
-    ]["customer_id"] = customer_id
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        products = SalesService(
-            conn
-        ).list_products()
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"{product['name']} | "
-                f"موجودی {product['stock_qty']:g}",
-                callback_data=f"sale:product:{product['id']}",
-            )
-        ]
-        for product in products
-    ]
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="sale:cancel",
-            )
-        ]
-    )
-    await query.edit_message_text(
-        "📦 کالا را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        ),
-    )
-    return CHOOSE_PRODUCT
-async def choose_product(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    product_id = int(
-        query.data.split(":")[-1]
-    )
-    with get_conn(
-        context.application.bot_data["db_path"]
-    ) as conn:
-        product = SalesService(
-            conn
-        ).get_product(product_id)
-    if not product:
-        await query.edit_message_text(
-            "❌ کالا پیدا نشد.",
-            reply_markup=back_home_markup(),
-        )
-        return ConversationHandler.END
-    context.user_data[
-        "sale"
-    ].update(
-        {
-            "product_id": product_id,
-            "product_name": product["name"],
-            "default_price": product["sale_price"],
-        }
-    )
-    await query.edit_message_text(
-        f"📦 {product['name']}\n\n"
-        f"💰 قیمت پیشنهادی: "
-        f"{money(product['sale_price'])}\n\n"
-        "🔢 تعداد را وارد کنید:"
-    )
-    return ENTER_QTY
-async def enter_qty(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        quantity_text = digits(
-            update.message.text
-        )
-        quantity = float(
-            quantity_text
-            .replace(",", "")
-            .replace("٬", "")
-        )
-        if quantity <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text(
-            "❌ تعداد معتبر وارد کنید.\n"
-            "مثال: 2 یا 2.5"
-        )
-        return ENTER_QTY
-    context.user_data[
-        "sale"
-    ]["qty"] = quantity
-    default_price = context.user_data[
-        "sale"
-    ]["default_price"]
-    await update.message.reply_text(
-        "💰 قیمت واحد به ریال:\n"
-        f"پیشنهادی: {money(default_price)}"
-    )
-    return ENTER_PRICE
-async def enter_price(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        price = to_int(
-            update.message.text,
-            0,
-        )
-        context.user_data[
-            "sale"
-        ]["unit_price"] = price
-        await update.message.reply_text(
-            "🎁 تخفیف به ریال وارد کنید.\n"
-            "اگر ندارد، 0:"
-        )
-        return ENTER_DISCOUNT
-    except ValueError:
-        await update.message.reply_text(
-            "❌ قیمت معتبر وارد کنید."
-        )
-        return ENTER_PRICE
-async def enter_discount(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        discount = to_int(
-            update.message.text,
-            0,
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "❌ تخفیف معتبر وارد کنید."
-        )
-        return ENTER_DISCOUNT
-    sale = context.user_data["sale"]
-    subtotal = round(
-        sale["qty"] * sale["unit_price"]
-    )
-    if discount > subtotal:
-        await update.message.reply_text(
-            "❌ تخفیف نمی‌تواند از مبلغ فروش بیشتر باشد."
-        )
-        return ENTER_DISCOUNT
-    sale["discount"] = discount
-    await update.message.reply_text(
-        "💳 روش تسویه را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "💵 نقدی",
-                        callback_data="sale:pay:cash",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏦 بانکی",
-                        callback_data="sale:pay:bank",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🧾 نسیه",
-                        callback_data="sale:pay:credit",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ لغو",
-                        callback_data="sale:cancel",
-                    )
-                ],
-            ]
-        ),
-    )
-    return CHOOSE_PAYMENT
-async def choose_payment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    payment = query.data.split(":")[-1]
-    sale = context.user_data["sale"]
-    sale["payment_method"] = payment
-    subtotal = round(
-        sale["qty"] * sale["unit_price"]
-    )
-    total = (
-        subtotal
-        - sale["discount"]
-    )
-    labels = {
-        "cash": "نقدی",
-        "bank": "بانکی",
-        "credit": "نسیه / دریافتنی",
-    }
-    payment_label = labels[payment]
-    text = (
         "🧾 پیش‌نمایش فروش\n\n"
-        f"📦 کالا: {sale['product_name']}\n"
-        f"🔢 تعداد: {sale['qty']:g}\n"
-        f"💰 قیمت واحد: "
-        f"{money(sale['unit_price'])}\n"
-        f"جمع: {money(subtotal)}\n"
-        f"🎁 تخفیف: {money(sale['discount'])}\n"
-        f"مالیات: فعلاً 0\n"
-        f"💵 مبلغ نهایی: {money(total)}\n"
-        f"💳 تسویه: {payment_label}\n\n"
-        "ثبت نهایی شود؟"
+        f"👤 مشتری: "
+        f"{customer['name'] if customer else '-'}\n"
+        f"📦 کالا: "
+        f"{product['name'] if product else '-'}\n"
+        f"🔢 تعداد: {quantity:g}\n"
+        f"💰 قیمت واحد: {price:,}\n"
+        f"💵 مبلغ ناخالص: {gross:,}\n"
+        f"🏷️ تخفیف: {discount:,}\n"
+        f"💳 مبلغ نهایی: {net:,}\n"
+        f"💳 روش پرداخت: "
+        f"{payment_method_fa(payment)}\n\n"
+        "آیا فروش ثبت شود؟\n"
+        "بله / خیر"
     )
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ ثبت نهایی",
-                        callback_data="sale:confirm",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ لغو",
-                        callback_data="sale:cancel",
-                    )
-                ],
-            ]
-        ),
-    )
-    return CONFIRM
-async def confirm_sale(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context.user_data["state"] = "sale_confirm"
+# ============================================================
+# گزارش‌ها
+# ============================================================
+async def reports_menu(
+    update,
+    context
 ):
-    query = update.callback_query
-    await query.answer()
-    sale = context.user_data["sale"]
+    conn = get_conn()
     try:
-        with get_conn(
-            context.application.bot_data["db_path"]
-        ) as conn:
-            result = SalesService(
-                conn
-            ).create_sale(
-                customer_id=sale["customer_id"],
-                product_id=sale["product_id"],
-                qty=sale["qty"],
-                unit_price=sale["unit_price"],
-                discount=sale["discount"],
-                payment_method=sale["payment_method"],
-                telegram_user_id=update.effective_user.id,
-            )
-    except Exception as exc:
-        await query.edit_message_text(
-            "❌ ثبت فروش انجام نشد:\n\n"
-            f"{exc}",
-            reply_markup=back_home_markup(),
-        )
-        context.user_data.pop(
-            "sale",
-            None,
-        )
-        return ConversationHandler.END
-    await query.edit_message_text(
-        "✅ فروش با موفقیت ثبت شد.\n\n"
-        f"🧾 شماره فاکتور: "
-        f"{result['invoice_no']}\n"
-        f"👤 مشتری: {result['customer_name']}\n"
-        f"📦 کالا: {result['product_name']}\n"
-        f"💵 مبلغ: {money(result['total'])}\n\n"
-        "📒 سند حسابداری ثبت شد.\n"
-        "📦 خروج موجودی ثبت شد.",
-        reply_markup=back_home_markup(),
-    )
-    context.user_data.pop(
-        "sale",
-        None,
-    )
-    return ConversationHandler.END
-async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-    context.user_data.clear()
-    await query.edit_message_text(
-        "❌ عملیات لغو شد.",
-        reply_markup=main_menu(),
-    )
-    return ConversationHandler.END
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    context.user_data.clear()
+        sales_count = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM invoices
+            WHERE invoice_type = 'SALE'
+            """
+        ).fetchone()["c"]
+        sales_total = conn.execute(
+            """
+            SELECT COALESCE(
+                SUM(payable_amount),
+                0
+            ) AS total
+            FROM invoices
+            WHERE invoice_type = 'SALE'
+            """
+        ).fetchone()["total"]
+        customers_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM customers
+            WHERE active = 1
+            """
+        ).fetchone()[0]
+        products_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM products
+            WHERE active = 1
+            """
+        ).fetchone()[0]
+    finally:
+        conn.close()
     await update.message.reply_text(
-        "❌ عملیات لغو شد.",
-        reply_markup=main_menu(),
+        "📊 گزارش سریع\n\n"
+        f"🧾 تعداد فروش: {sales_count}\n"
+        f"💰 مجموع فروش: {int(sales_total):,} تومان\n"
+        f"👥 مشتری فعال: {customers_count}\n"
+        f"📦 کالای فعال: {products_count}"
     )
-    return ConversationHandler.END
-# =========================================================
-# Application
-# =========================================================
+# ============================================================
+# تنظیمات
+# ============================================================
+async def settings_menu(
+    update,
+    context
+):
+    await update.message.reply_text(
+        "⚙️ تنظیمات حساب‌یار پرو\n\n"
+        "نسخه فعلی: MVP\n"
+        "موتور حسابداری: فعال\n"
+        "دیتابیس: SQLite\n"
+        "ثبت فروش: فعال\n"
+        "مدیریت مشتری: فعال\n"
+        "مدیریت کالا: فعال"
+    )
+# ============================================================
+# دستورات متنی اختصاصی
+# ============================================================
+async def text_command_handler(
+    update,
+    context
+):
+    text = update.message.text.strip()
+    if text == "➕ مشتری جدید":
+        await customer_new(
+            update,
+            context
+        )
+        return
+    if text == "➕ کالای جدید":
+        await product_new(
+            update,
+            context
+        )
+        return
+    await menu_handler(
+        update,
+        context
+    )
+# ============================================================
+# register_handlers
+# ============================================================
+def register_handlers(
+    application: Application
+):
+    """
+    ثبت تمام Handlerهای بات.
+    این تابع توسط app.main فراخوانی می‌شود.
+    """
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_command_handler,
+        )
+    )
+# ============================================================
+# ساخت Application
+# ============================================================
 def build_application(
-    token: str,
-    db_path: str,
-) -> Application:
+    bot_token=None
+):
+    if not bot_token:
+        bot_token = os.getenv(
+            "BOT_TOKEN"
+        )
+    if not bot_token:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable "
+            "is not configured."
+        )
+    init_db()
     application = (
-        Application
-        .builder()
-        .token(token)
+        Application.builder()
+        .token(bot_token)
         .concurrent_updates(False)
         .build()
     )
-    application.bot_data[
-        "db_path"
-    ] = db_path
-    # -----------------------------------------------------
-    # Sales Conversation
-    # -----------------------------------------------------
-    sale_conversation = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                sale_start,
-                pattern=r"^sale:start$",
-            )
-        ],
-        states={
-            CHOOSE_CUSTOMER: [
-                CallbackQueryHandler(
-                    choose_customer,
-                    pattern=r"^sale:customer:\d+$",
-                )
-            ],
-            CHOOSE_PRODUCT: [
-                CallbackQueryHandler(
-                    choose_product,
-                    pattern=r"^sale:product:\d+$",
-                )
-            ],
-            ENTER_QTY: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    enter_qty,
-                )
-            ],
-            ENTER_PRICE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    enter_price,
-                )
-            ],
-            ENTER_DISCOUNT: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    enter_discount,
-                )
-            ],
-            CHOOSE_PAYMENT: [
-                CallbackQueryHandler(
-                    choose_payment,
-                    pattern=r"^sale:pay:(cash|bank|credit)$",
-                )
-            ],
-            CONFIRM: [
-                CallbackQueryHandler(
-                    confirm_sale,
-                    pattern=r"^sale:confirm$",
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel_command,
-            ),
-            CallbackQueryHandler(
-                cancel,
-                pattern=r"^sale:cancel$",
-            ),
-        ],
-        allow_reentry=True,
-    )
-    # -----------------------------------------------------
-    # Customer Add
-    # -----------------------------------------------------
-    customer_add = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                customer_add_start,
-                pattern=r"^customer:add$",
-            )
-        ],
-        states={
-            C_NAME: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_add_name,
-                )
-            ],
-            C_PHONE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_add_phone,
-                )
-            ],
-            C_BALANCE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_add_balance,
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel_command,
-            )
-        ],
-        allow_reentry=True,
-    )
-    # -----------------------------------------------------
-    # Customer Edit
-    # -----------------------------------------------------
-    customer_edit = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                customer_edit_start,
-                pattern=r"^customer:edit:\d+$",
-            )
-        ],
-        states={
-            C_NAME: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_edit_name,
-                )
-            ],
-            C_PHONE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_edit_phone,
-                )
-            ],
-            C_BALANCE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    customer_edit_balance,
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel_command,
-            )
-        ],
-        allow_reentry=True,
-    )
-    # -----------------------------------------------------
-    # Product Add
-    # -----------------------------------------------------
-    product_add = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                product_add_start,
-                pattern=r"^product:add$",
-            )
-        ],
-        states={
-            P_SKU: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_add_sku,
-                )
-            ],
-            P_NAME: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_add_name,
-                )
-            ],
-            P_SALE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_add_sale,
-                )
-            ],
-            P_COST: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_add_cost,
-                )
-            ],
-            P_STOCK: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_add_stock,
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel_command,
-            )
-        ],
-        allow_reentry=True,
-    )
-    # -----------------------------------------------------
-    # Product Edit
-    # -----------------------------------------------------
-    product_edit = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                product_edit_start,
-                pattern=r"^product:edit:\d+$",
-            )
-        ],
-        states={
-            P_SKU: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_edit_sku,
-                )
-            ],
-            P_NAME: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_edit_name,
-                )
-            ],
-            P_SALE: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_edit_sale,
-                )
-            ],
-            P_COST: [
-                MessageHandler(
-                    filters.TEXT
-                    & ~filters.COMMAND,
-                    product_edit_cost,
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                cancel_command,
-            )
-        ],
-        allow_reentry=True,
-    )
-    # -----------------------------------------------------
-    # Register handlers
-    # -----------------------------------------------------
     application.add_handler(
         CommandHandler(
             "start",
-            start,
+            start_command
         )
     )
-    application.add_handler(
-        sale_conversation
-    )
-    application.add_handler(
-        customer_add
-    )
-    application.add_handler(
-        customer_edit
-    )
-    application.add_handler(
-        product_add
-    )
-    application.add_handler(
-        product_edit
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            home,
-            pattern=r"^home$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            coming,
-            pattern=r"^coming:(purchase|reports|settings)$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            customers_list,
-            pattern=r"^customers:list$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            customer_view,
-            pattern=r"^customer:view:\d+$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            customer_deactivate,
-            pattern=r"^customer:deactivate:\d+$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            products_list,
-            pattern=r"^products:list$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            product_view,
-            pattern=r"^product:view:\d+$",
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            product_deactivate,
-            pattern=r"^product:deactivate:\d+$",
-        )
+    register_handlers(
+        application
     )
     return application
+# ============================================================
+# اجرای مستقیم bot.py
+# ============================================================
+def main():
+    token = os.getenv(
+        "BOT_TOKEN"
+    )
+    if not token:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable "
+            "is not configured."
+        )
+    application = build_application(
+        token
+    )
+    logger.info(
+        "HesabYar Pro Bot is starting..."
+    )
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+if __name__ == "__main__":
+    main()
