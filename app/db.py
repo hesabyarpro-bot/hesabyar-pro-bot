@@ -3,10 +3,27 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "hesabyar.db")))
+DB_PATH = Path(
+    os.getenv(
+        "DB_PATH",
+        str(BASE_DIR / "hesabyar.db")
+    )
+)
+# ============================================================
+# SCHEMA
+# ============================================================
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT,
+    address TEXT,
+    notes TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS suppliers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     phone TEXT,
@@ -31,6 +48,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     invoice_no TEXT UNIQUE,
     invoice_type TEXT NOT NULL DEFAULT 'SALE',
     customer_id INTEGER,
+    supplier_id INTEGER,
     total_amount INTEGER NOT NULL DEFAULT 0,
     discount_amount INTEGER NOT NULL DEFAULT 0,
     tax_amount INTEGER NOT NULL DEFAULT 0,
@@ -38,7 +56,10 @@ CREATE TABLE IF NOT EXISTS invoices (
     payment_method TEXT,
     status TEXT NOT NULL DEFAULT 'CONFIRMED',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(customer_id) REFERENCES customers(id)
+    FOREIGN KEY(customer_id)
+        REFERENCES customers(id),
+    FOREIGN KEY(supplier_id)
+        REFERENCES suppliers(id)
 );
 CREATE TABLE IF NOT EXISTS invoice_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,8 +70,11 @@ CREATE TABLE IF NOT EXISTS invoice_items (
     discount_amount INTEGER NOT NULL DEFAULT 0,
     tax_amount INTEGER NOT NULL DEFAULT 0,
     line_total INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
-    FOREIGN KEY(product_id) REFERENCES products(id)
+    FOREIGN KEY(invoice_id)
+        REFERENCES invoices(id)
+        ON DELETE CASCADE,
+    FOREIGN KEY(product_id)
+        REFERENCES products(id)
 );
 CREATE TABLE IF NOT EXISTS journal_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,10 +105,13 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     reference_type TEXT,
     reference_id INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(product_id) REFERENCES products(id)
+    FOREIGN KEY(product_id)
+        REFERENCES products(id)
 );
 CREATE INDEX IF NOT EXISTS idx_customers_active
 ON customers(active);
+CREATE INDEX IF NOT EXISTS idx_suppliers_active
+ON suppliers(active);
 CREATE INDEX IF NOT EXISTS idx_products_active
 ON products(active);
 CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice
@@ -95,140 +122,197 @@ CREATE INDEX IF NOT EXISTS idx_stock_movements_product
 ON stock_movements(product_id);
 CREATE INDEX IF NOT EXISTS idx_journal_lines_account
 ON journal_lines(account_code);
+CREATE INDEX IF NOT EXISTS idx_invoices_type
+ON invoices(invoice_type);
+CREATE INDEX IF NOT EXISTS idx_invoices_customer
+ON invoices(customer_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_supplier
+ON invoices(supplier_id);
 """
+# ============================================================
+# CONNECTION
+# ============================================================
 def get_conn():
-    """
-    ایجاد اتصال به دیتابیس SQLite.
-    نام اصلی تابع در پروژه: get_conn
-    """
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
     conn = sqlite3.connect(
         str(DB_PATH),
         timeout=30,
         check_same_thread=False
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+    conn.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
+    conn.execute(
+        "PRAGMA journal_mode = WAL"
+    )
     return conn
 def get_connection():
     """
-    نام سازگار برای کدهای قدیمی پروژه.
-    بعضی فایل‌های پروژه ممکن است هنوز از:
-        get_connection()
-    استفاده کنند.
-    این تابع همان اتصال get_conn() را برمی‌گرداند.
+    سازگاری با نسخه‌های قبلی پروژه.
     """
     return get_conn()
-def column_exists(conn, table_name, column_name):
-    """
-    بررسی وجود یک ستون در جدول.
-    """
-    rows = conn.execute(
-        f"PRAGMA table_info({table_name})"
-    ).fetchall()
-    return any(row["name"] == column_name for row in rows)
-def table_exists(conn, table_name):
-    """
-    بررسی وجود جدول.
-    """
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+def table_exists(
+    conn,
+    table_name
+):
     row = conn.execute(
         """
         SELECT name
         FROM sqlite_master
         WHERE type = 'table'
-          AND name = ?
+        AND name = ?
         """,
         (table_name,)
     ).fetchone()
     return row is not None
+def column_exists(
+    conn,
+    table_name,
+    column_name
+):
+    rows = conn.execute(
+        f"PRAGMA table_info({table_name})"
+    ).fetchall()
+    return any(
+        row["name"] == column_name
+        for row in rows
+    )
+# ============================================================
+# MIGRATION
+# ============================================================
 def migrate_database(conn):
-    """
-    مهاجرت‌های لازم برای نسخه‌های قدیمی دیتابیس.
-    """
-    # ---------------------------------------------------------
-    # customers.active
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # customers
+    # --------------------------------------------------------
     if table_exists(conn, "customers"):
-        if not column_exists(conn, "customers", "active"):
+        if not column_exists(
+            conn,
+            "customers",
+            "active"
+        ):
             conn.execute(
                 """
                 ALTER TABLE customers
-                ADD COLUMN active INTEGER NOT NULL DEFAULT 1
+                ADD COLUMN active
+                INTEGER NOT NULL DEFAULT 1
                 """
             )
-    # ---------------------------------------------------------
-    # products.active
-    # ---------------------------------------------------------
+        if not column_exists(
+            conn,
+            "customers",
+            "created_at"
+        ):
+            conn.execute(
+                """
+                ALTER TABLE customers
+                ADD COLUMN created_at TEXT
+                """
+            )
+    # --------------------------------------------------------
+    # products
+    # --------------------------------------------------------
     if table_exists(conn, "products"):
-        if not column_exists(conn, "products", "active"):
+        if not column_exists(
+            conn,
+            "products",
+            "active"
+        ):
             conn.execute(
                 """
                 ALTER TABLE products
-                ADD COLUMN active INTEGER NOT NULL DEFAULT 1
+                ADD COLUMN active
+                INTEGER NOT NULL DEFAULT 1
                 """
             )
-        if not column_exists(conn, "products", "created_at"):
+        if not column_exists(
+            conn,
+            "products",
+            "created_at"
+        ):
             conn.execute(
                 """
                 ALTER TABLE products
                 ADD COLUMN created_at TEXT
                 """
             )
-    # ---------------------------------------------------------
-    # customers.created_at
-    # ---------------------------------------------------------
-    if table_exists(conn, "customers"):
-        if not column_exists(conn, "customers", "created_at"):
+    # --------------------------------------------------------
+    # invoices
+    # --------------------------------------------------------
+    if table_exists(conn, "invoices"):
+        if not column_exists(
+            conn,
+            "invoices",
+            "supplier_id"
+        ):
             conn.execute(
                 """
-                ALTER TABLE customers
-                ADD COLUMN created_at TEXT
+                ALTER TABLE invoices
+                ADD COLUMN supplier_id INTEGER
                 """
             )
     conn.commit()
+# ============================================================
+# SEED
+# ============================================================
 def seed_sample_data(conn):
-    """
-    فقط در صورتی که جدول‌ها خالی باشند،
-    چند داده نمونه ایجاد می‌کند.
-    """
     customer_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM customers"
+        """
+        SELECT COUNT(*) AS c
+        FROM customers
+        """
     ).fetchone()["c"]
     if customer_count == 0:
         conn.execute(
             """
             INSERT INTO customers
-                (name, phone, address, notes, active)
+            (
+                name,
+                phone,
+                address,
+                notes,
+                active
+            )
             VALUES
-                (?, ?, ?, ?, 1)
+            (?, ?, ?, ?, 1)
             """,
             (
                 "مشتری نمونه",
                 "09120000000",
                 "",
-                "داده نمونه حساب‌یار پرو",
+                "داده نمونه حساب‌یار پرو"
             )
         )
     product_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM products"
+        """
+        SELECT COUNT(*) AS c
+        FROM products
+        """
     ).fetchone()["c"]
     if product_count == 0:
         conn.execute(
             """
             INSERT INTO products
-                (
-                    name,
-                    sku,
-                    unit,
-                    sale_price,
-                    purchase_cost,
-                    stock,
-                    active
-                )
+            (
+                name,
+                sku,
+                unit,
+                sale_price,
+                purchase_cost,
+                stock,
+                active
+            )
             VALUES
-                (?, ?, ?, ?, ?, ?, 1)
+            (?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 "کالای نمونه",
@@ -236,53 +320,98 @@ def seed_sample_data(conn):
                 "عدد",
                 100000,
                 70000,
-                10,
+                10
+            )
+        )
+    supplier_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM suppliers
+        """
+    ).fetchone()["c"]
+    if supplier_count == 0:
+        conn.execute(
+            """
+            INSERT INTO suppliers
+            (
+                name,
+                phone,
+                address,
+                notes,
+                active
+            )
+            VALUES
+            (?, ?, ?, ?, 1)
+            """,
+            (
+                "تأمین‌کننده نمونه",
+                "09121111111",
+                "",
+                "داده نمونه حساب‌یار پرو"
             )
         )
     conn.commit()
+# ============================================================
+# INIT DB
+# ============================================================
 def init_db():
-    """
-    ساخت دیتابیس و اجرای migrationها.
-    """
     conn = get_conn()
     try:
-        conn.executescript(SCHEMA)
+        conn.executescript(
+            SCHEMA
+        )
         conn.commit()
-        migrate_database(conn)
-        seed_sample_data(conn)
+        migrate_database(
+            conn
+        )
+        seed_sample_data(
+            conn
+        )
     finally:
         conn.close()
-def execute(query, params=()):
-    """
-    اجرای یک دستور SQL و commit.
-    """
+# ============================================================
+# GENERIC
+# ============================================================
+def execute(
+    query,
+    params=()
+):
     conn = get_conn()
     try:
-        cursor = conn.execute(query, params)
+        cursor = conn.execute(
+            query,
+            params
+        )
         conn.commit()
         return cursor
     finally:
         conn.close()
-def fetch_one(query, params=()):
-    """
-    دریافت یک رکورد.
-    """
+def fetch_one(
+    query,
+    params=()
+):
     conn = get_conn()
     try:
-        return conn.execute(query, params).fetchone()
+        return conn.execute(
+            query,
+            params
+        ).fetchone()
     finally:
         conn.close()
-def fetch_all(query, params=()):
-    """
-    دریافت چند رکورد.
-    """
+def fetch_all(
+    query,
+    params=()
+):
     conn = get_conn()
     try:
-        return conn.execute(query, params).fetchall()
+        return conn.execute(
+            query,
+            params
+        ).fetchall()
     finally:
         conn.close()
 # ============================================================
-# مشتریان
+# CUSTOMERS
 # ============================================================
 def create_customer(
     name,
@@ -295,22 +424,30 @@ def create_customer(
         cursor = conn.execute(
             """
             INSERT INTO customers
-                (name, phone, address, notes, active)
-            VALUES
-                (?, ?, ?, ?, 1)
-            """,
             (
                 name,
                 phone,
                 address,
                 notes,
+                active
+            )
+            VALUES
+            (?, ?, ?, ?, 1)
+            """,
+            (
+                name,
+                phone,
+                address,
+                notes
             )
         )
         conn.commit()
         return cursor.lastrowid
     finally:
         conn.close()
-def get_customer(customer_id):
+def get_customer(
+    customer_id
+):
     return fetch_one(
         """
         SELECT *
@@ -319,27 +456,25 @@ def get_customer(customer_id):
         """,
         (customer_id,)
     )
-def list_customers(active_only=True):
-    conn = get_conn()
-    try:
-        if active_only:
-            return conn.execute(
-                """
-                SELECT *
-                FROM customers
-                WHERE active = 1
-                ORDER BY id DESC
-                """
-            ).fetchall()
-        return conn.execute(
+def list_customers(
+    active_only=True
+):
+    if active_only:
+        return fetch_all(
             """
             SELECT *
             FROM customers
+            WHERE active = 1
             ORDER BY id DESC
             """
-        ).fetchall()
-    finally:
-        conn.close()
+        )
+    return fetch_all(
+        """
+        SELECT *
+        FROM customers
+        ORDER BY id DESC
+        """
+    )
 def update_customer(
     customer_id,
     name,
@@ -347,30 +482,27 @@ def update_customer(
     address="",
     notes=""
 ):
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            UPDATE customers
-            SET
-                name = ?,
-                phone = ?,
-                address = ?,
-                notes = ?
-            WHERE id = ?
-            """,
-            (
-                name,
-                phone,
-                address,
-                notes,
-                customer_id,
-            )
+    execute(
+        """
+        UPDATE customers
+        SET
+            name = ?,
+            phone = ?,
+            address = ?,
+            notes = ?
+        WHERE id = ?
+        """,
+        (
+            name,
+            phone,
+            address,
+            notes,
+            customer_id
         )
-        conn.commit()
-    finally:
-        conn.close()
-def deactivate_customer(customer_id):
+    )
+def deactivate_customer(
+    customer_id
+):
     execute(
         """
         UPDATE customers
@@ -379,7 +511,9 @@ def deactivate_customer(customer_id):
         """,
         (customer_id,)
     )
-def activate_customer(customer_id):
+def activate_customer(
+    customer_id
+):
     execute(
         """
         UPDATE customers
@@ -389,7 +523,119 @@ def activate_customer(customer_id):
         (customer_id,)
     )
 # ============================================================
-# کالاها
+# SUPPLIERS
+# ============================================================
+def create_supplier(
+    name,
+    phone="",
+    address="",
+    notes=""
+):
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO suppliers
+            (
+                name,
+                phone,
+                address,
+                notes,
+                active
+            )
+            VALUES
+            (?, ?, ?, ?, 1)
+            """,
+            (
+                name,
+                phone,
+                address,
+                notes
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+def get_supplier(
+    supplier_id
+):
+    return fetch_one(
+        """
+        SELECT *
+        FROM suppliers
+        WHERE id = ?
+        """,
+        (supplier_id,)
+    )
+def list_suppliers(
+    active_only=True
+):
+    if active_only:
+        return fetch_all(
+            """
+            SELECT *
+            FROM suppliers
+            WHERE active = 1
+            ORDER BY id DESC
+            """
+        )
+    return fetch_all(
+        """
+        SELECT *
+        FROM suppliers
+        ORDER BY id DESC
+        """
+    )
+def update_supplier(
+    supplier_id,
+    name,
+    phone="",
+    address="",
+    notes=""
+):
+    execute(
+        """
+        UPDATE suppliers
+        SET
+            name = ?,
+            phone = ?,
+            address = ?,
+            notes = ?
+        WHERE id = ?
+        """,
+        (
+            name,
+            phone,
+            address,
+            notes,
+            supplier_id
+        )
+    )
+def deactivate_supplier(
+    supplier_id
+):
+    execute(
+        """
+        UPDATE suppliers
+        SET active = 0
+        WHERE id = ?
+        """,
+        (supplier_id,)
+    )
+def activate_supplier(
+    supplier_id
+):
+    execute(
+        """
+        UPDATE suppliers
+        SET active = 1
+        WHERE id = ?
+        """,
+        (supplier_id,)
+    )
+# ============================================================
+# PRODUCTS
 # ============================================================
 def create_product(
     name,
@@ -404,18 +650,6 @@ def create_product(
         cursor = conn.execute(
             """
             INSERT INTO products
-                (
-                    name,
-                    sku,
-                    unit,
-                    sale_price,
-                    purchase_cost,
-                    stock,
-                    active
-                )
-            VALUES
-                (?, ?, ?, ?, ?, ?, 1)
-            """,
             (
                 name,
                 sku,
@@ -423,6 +657,18 @@ def create_product(
                 sale_price,
                 purchase_cost,
                 stock,
+                active
+            )
+            VALUES
+            (?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                name,
+                sku,
+                unit,
+                sale_price,
+                purchase_cost,
+                stock
             )
         )
         conn.commit()
@@ -432,7 +678,9 @@ def create_product(
         raise
     finally:
         conn.close()
-def get_product(product_id):
+def get_product(
+    product_id
+):
     return fetch_one(
         """
         SELECT *
@@ -441,7 +689,9 @@ def get_product(product_id):
         """,
         (product_id,)
     )
-def get_product_by_sku(sku):
+def get_product_by_sku(
+    sku
+):
     return fetch_one(
         """
         SELECT *
@@ -450,27 +700,25 @@ def get_product_by_sku(sku):
         """,
         (sku,)
     )
-def list_products(active_only=True):
-    conn = get_conn()
-    try:
-        if active_only:
-            return conn.execute(
-                """
-                SELECT *
-                FROM products
-                WHERE active = 1
-                ORDER BY id DESC
-                """
-            ).fetchall()
-        return conn.execute(
+def list_products(
+    active_only=True
+):
+    if active_only:
+        return fetch_all(
             """
             SELECT *
             FROM products
+            WHERE active = 1
             ORDER BY id DESC
             """
-        ).fetchall()
-    finally:
-        conn.close()
+        )
+    return fetch_all(
+        """
+        SELECT *
+        FROM products
+        ORDER BY id DESC
+        """
+    )
 def update_product(
     product_id,
     name,
@@ -498,7 +746,7 @@ def update_product(
                 unit,
                 sale_price,
                 purchase_cost,
-                product_id,
+                product_id
             )
         )
         conn.commit()
@@ -507,7 +755,9 @@ def update_product(
         raise
     finally:
         conn.close()
-def deactivate_product(product_id):
+def deactivate_product(
+    product_id
+):
     execute(
         """
         UPDATE products
@@ -516,7 +766,9 @@ def deactivate_product(product_id):
         """,
         (product_id,)
     )
-def activate_product(product_id):
+def activate_product(
+    product_id
+):
     execute(
         """
         UPDATE products
@@ -529,35 +781,25 @@ def update_product_stock(
     product_id,
     quantity
 ):
-    """
-    افزایش/کاهش موجودی کالا.
-    مثال:
-        update_product_stock(1, 5)
-        update_product_stock(1, -2)
-    """
-    conn = get_conn()
-    try:
-        conn.execute(
-            """
-            UPDATE products
-            SET stock = stock + ?
-            WHERE id = ?
-            """,
-            (
-                quantity,
-                product_id,
-            )
+    execute(
+        """
+        UPDATE products
+        SET stock = stock + ?
+        WHERE id = ?
+        """,
+        (
+            quantity,
+            product_id
         )
-        conn.commit()
-    finally:
-        conn.close()
+    )
 # ============================================================
-# فاکتور
+# INVOICES
 # ============================================================
 def create_invoice(
     invoice_no,
     invoice_type="SALE",
     customer_id=None,
+    supplier_id=None,
     total_amount=0,
     discount_amount=0,
     tax_amount=0,
@@ -570,30 +812,32 @@ def create_invoice(
         cursor = conn.execute(
             """
             INSERT INTO invoices
-                (
-                    invoice_no,
-                    invoice_type,
-                    customer_id,
-                    total_amount,
-                    discount_amount,
-                    tax_amount,
-                    payable_amount,
-                    payment_method,
-                    status
-                )
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
             (
                 invoice_no,
                 invoice_type,
                 customer_id,
+                supplier_id,
                 total_amount,
                 discount_amount,
                 tax_amount,
                 payable_amount,
                 payment_method,
-                status,
+                status
+            )
+            VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invoice_no,
+                invoice_type,
+                customer_id,
+                supplier_id,
+                total_amount,
+                discount_amount,
+                tax_amount,
+                payable_amount,
+                payment_method,
+                status
             )
         )
         conn.commit()
@@ -614,17 +858,17 @@ def add_invoice_item(
         cursor = conn.execute(
             """
             INSERT INTO invoice_items
-                (
-                    invoice_id,
-                    product_id,
-                    quantity,
-                    unit_price,
-                    discount_amount,
-                    tax_amount,
-                    line_total
-                )
+            (
+                invoice_id,
+                product_id,
+                quantity,
+                unit_price,
+                discount_amount,
+                tax_amount,
+                line_total
+            )
             VALUES
-                (?, ?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 invoice_id,
@@ -633,7 +877,7 @@ def add_invoice_item(
                 unit_price,
                 discount_amount,
                 tax_amount,
-                line_total,
+                line_total
             )
         )
         conn.commit()
@@ -641,7 +885,7 @@ def add_invoice_item(
     finally:
         conn.close()
 # ============================================================
-# اسناد حسابداری
+# JOURNAL
 # ============================================================
 def create_journal_entry(
     entry_no,
@@ -651,28 +895,30 @@ def create_journal_entry(
     entry_date=None
 ):
     if entry_date is None:
-        entry_date = datetime.now().strftime("%Y-%m-%d")
+        entry_date = datetime.now().strftime(
+            "%Y-%m-%d"
+        )
     conn = get_conn()
     try:
         cursor = conn.execute(
             """
             INSERT INTO journal_entries
-                (
-                    entry_no,
-                    description,
-                    reference_type,
-                    reference_id,
-                    entry_date
-                )
+            (
+                entry_no,
+                description,
+                reference_type,
+                reference_id,
+                entry_date
+            )
             VALUES
-                (?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?)
             """,
             (
                 entry_no,
                 description,
                 reference_type,
                 reference_id,
-                entry_date,
+                entry_date
             )
         )
         conn.commit()
@@ -691,22 +937,22 @@ def add_journal_line(
         cursor = conn.execute(
             """
             INSERT INTO journal_lines
-                (
-                    journal_entry_id,
-                    account_code,
-                    description,
-                    debit,
-                    credit
-                )
+            (
+                journal_entry_id,
+                account_code,
+                description,
+                debit,
+                credit
+            )
             VALUES
-                (?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?)
             """,
             (
                 journal_entry_id,
                 account_code,
                 description,
                 debit,
-                credit,
+                credit
             )
         )
         conn.commit()
@@ -714,7 +960,7 @@ def add_journal_line(
     finally:
         conn.close()
 # ============================================================
-# گردش انبار
+# STOCK
 # ============================================================
 def add_stock_movement(
     product_id,
@@ -729,16 +975,16 @@ def add_stock_movement(
         cursor = conn.execute(
             """
             INSERT INTO stock_movements
-                (
-                    product_id,
-                    movement_type,
-                    quantity,
-                    unit_cost,
-                    reference_type,
-                    reference_id
-                )
+            (
+                product_id,
+                movement_type,
+                quantity,
+                unit_cost,
+                reference_type,
+                reference_id
+            )
             VALUES
-                (?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?)
             """,
             (
                 product_id,
@@ -746,7 +992,7 @@ def add_stock_movement(
                 quantity,
                 unit_cost,
                 reference_type,
-                reference_id,
+                reference_id
             )
         )
         conn.commit()
