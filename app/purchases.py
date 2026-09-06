@@ -1,140 +1,90 @@
-from datetime import date
-
-from app.db import get_connection
+from app.db import (
+    db_transaction,
+    get_supplier,
+    get_product,
+    get_invoice,
+    list_invoices,
+    now,
+)
 
 
 class PurchaseService:
 
-    # ========================================================
-    # Purchase Invoice
-    # ========================================================
-
+    @staticmethod
     def create_purchase(
-        self,
         supplier_id,
         items,
         discount=0,
         tax=0,
         payment_method="credit",
-        notes=""
+        notes="",
     ):
-
         if not items:
-            raise ValueError(
-                "حداقل یک قلم کالا باید ثبت شود."
-            )
+            raise ValueError("حداقل یک قلم کالا لازم است.")
 
-        conn = get_connection()
+        supplier = get_supplier(supplier_id)
 
-        try:
+        if not supplier or supplier["active"] != 1:
+            raise ValueError("تأمین‌کننده معتبر نیست.")
 
-            # ------------------------------------------------
-            # Validate supplier
-            # ------------------------------------------------
+        subtotal = 0
+        prepared_items = []
 
-            supplier = conn.execute("""
-                SELECT *
-                FROM suppliers
-                WHERE id = ?
-                  AND active = 1
-            """, (
-                supplier_id,
-            )).fetchone()
+        for item in items:
+            product_id = int(item["product_id"])
+            quantity = float(item["quantity"])
+            unit_price = float(item["unit_price"])
+            item_discount = float(item.get("discount", 0))
 
-            if not supplier:
+            if quantity <= 0:
+                raise ValueError("تعداد کالا باید بیشتر از صفر باشد.")
+
+            if unit_price < 0:
+                raise ValueError("قیمت کالا نمی‌تواند منفی باشد.")
+
+            product = get_product(product_id)
+
+            if not product or product["active"] != 1:
                 raise ValueError(
-                    "تأمین‌کننده پیدا نشد."
+                    f"کالای شماره {product_id} معتبر نیست."
                 )
 
-            # ------------------------------------------------
-            # Calculate totals
-            # ------------------------------------------------
+            line_gross = quantity * unit_price
+            line_total = line_gross - item_discount
 
-            subtotal = 0
-            validated_items = []
-
-            for item in items:
-
-                product_id = int(
-                    item["product_id"]
+            if line_total < 0:
+                raise ValueError(
+                    "تخفیف یک قلم نمی‌تواند بیشتر از مبلغ آن قلم باشد."
                 )
 
-                quantity = float(
-                    item["quantity"]
-                )
+            subtotal += line_total
 
-                unit_price = int(
-                    item["unit_price"]
-                )
-
-                item_discount = int(
-                    item.get("discount", 0)
-                )
-
-                if quantity <= 0:
-                    raise ValueError(
-                        "تعداد کالا باید بیشتر از صفر باشد."
-                    )
-
-                if unit_price < 0:
-                    raise ValueError(
-                        "قیمت خرید نمی‌تواند منفی باشد."
-                    )
-
-                product = conn.execute("""
-                    SELECT *
-                    FROM products
-                    WHERE id = ?
-                      AND active = 1
-                """, (
-                    product_id,
-                )).fetchone()
-
-                if not product:
-                    raise ValueError(
-                        f"کالا با شناسه {product_id} پیدا نشد."
-                    )
-
-                gross = int(
-                    quantity * unit_price
-                )
-
-                line_total = max(
-                    0,
-                    gross - item_discount
-                )
-
-                subtotal += line_total
-
-                validated_items.append({
+            prepared_items.append(
+                {
                     "product_id": product_id,
                     "quantity": quantity,
                     "unit_price": unit_price,
                     "discount": item_discount,
-                    "tax": int(item.get("tax", 0)),
-                    "line_total": line_total
-                })
-
-            total = (
-                subtotal
-                - int(discount)
-                + int(tax)
+                    "tax": float(item.get("tax", 0)),
+                    "total": line_total,
+                }
             )
 
-            if total < 0:
-                total = 0
+        discount = float(discount or 0)
+        tax = float(tax or 0)
 
-            # ------------------------------------------------
-            # Invoice
-            # ------------------------------------------------
+        total = subtotal - discount + tax
 
-            invoice_date = date.today().isoformat()
+        if total < 0:
+            raise ValueError("مبلغ نهایی نمی‌تواند منفی باشد.")
 
-            cur = conn.execute("""
+        with db_transaction() as conn:
+
+            cursor = conn.execute(
+                """
                 INSERT INTO invoices
                 (
                     invoice_type,
-                    invoice_number,
                     supplier_id,
                     invoice_date,
                     subtotal,
@@ -142,14 +92,12 @@ class PurchaseService:
                     tax,
                     total,
                     payment_method,
-                    status,
                     notes,
                     created_at
                 )
                 VALUES
                 (
                     'purchase',
-                    NULL,
                     ?,
                     ?,
                     ?,
@@ -157,30 +105,29 @@ class PurchaseService:
                     ?,
                     ?,
                     ?,
-                    'confirmed',
                     ?,
-                    datetime('now')
+                    ?
                 )
-            """, (
-                supplier_id,
-                invoice_date,
-                subtotal,
-                int(discount),
-                int(tax),
-                total,
-                payment_method,
-                notes
-            ))
+                """,
+                (
+                    supplier_id,
+                    now(),
+                    subtotal,
+                    discount,
+                    tax,
+                    total,
+                    payment_method,
+                    notes,
+                    now(),
+                ),
+            )
 
-            invoice_id = cur.lastrowid
+            invoice_id = cursor.lastrowid
 
-            # ------------------------------------------------
-            # Items + Stock
-            # ------------------------------------------------
+            for item in prepared_items:
 
-            for item in validated_items:
-
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO invoice_items
                     (
                         invoice_id,
@@ -189,81 +136,86 @@ class PurchaseService:
                         unit_price,
                         discount,
                         tax,
-                        line_total
+                        total
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    invoice_id,
-                    item["product_id"],
-                    item["quantity"],
-                    item["unit_price"],
-                    item["discount"],
-                    item["tax"],
-                    item["line_total"]
-                ))
+                    """,
+                    (
+                        invoice_id,
+                        item["product_id"],
+                        item["quantity"],
+                        item["unit_price"],
+                        item["discount"],
+                        item["tax"],
+                        item["total"],
+                    ),
+                )
 
-                # Increase stock
-                conn.execute("""
+                # افزایش موجودی
+                conn.execute(
+                    """
                     UPDATE products
-                    SET stock = COALESCE(stock, 0) + ?,
+                    SET stock = stock + ?,
                         purchase_cost = ?
-                    WHERE id = ?
-                """, (
-                    item["quantity"],
-                    item["unit_price"],
-                    item["product_id"]
-                ))
+                    WHERE id=?
+                    """,
+                    (
+                        item["quantity"],
+                        item["unit_price"],
+                        item["product_id"],
+                    ),
+                )
 
-                # Stock movement
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO stock_movements
                     (
                         product_id,
+                        invoice_id,
                         movement_type,
                         quantity,
                         unit_cost,
-                        reference_type,
-                        reference_id,
                         movement_date,
                         notes
                     )
-                    VALUES (?, 'purchase', ?, ?, 'purchase', ?, ?, ?)
-                """, (
-                    item["product_id"],
-                    item["quantity"],
-                    item["unit_price"],
-                    invoice_id,
-                    invoice_date,
-                    "ثبت خرید"
-                ))
+                    VALUES (?, ?, 'purchase', ?, ?, ?, ?)
+                    """,
+                    (
+                        item["product_id"],
+                        invoice_id,
+                        item["quantity"],
+                        item["unit_price"],
+                        now(),
+                        f"خرید فاکتور {invoice_id}",
+                    ),
+                )
 
-            # ------------------------------------------------
-            # Accounting Entry
-            # ------------------------------------------------
-
-            journal_cur = conn.execute("""
+            # سند حسابداری
+            journal_cursor = conn.execute(
+                """
                 INSERT INTO journal_entries
                 (
-                    entry_number,
                     entry_date,
                     description,
                     reference_type,
                     reference_id,
-                    status,
                     created_at
                 )
-                VALUES (?, ?, ?, 'purchase', ?, 'posted', datetime('now'))
-            """, (
-                f"PUR-{invoice_id}",
-                invoice_date,
-                f"ثبت فاکتور خرید شماره {invoice_id}",
-                invoice_id
-            ))
+                VALUES (?, ?, 'purchase', ?, ?)
+                """,
+                (
+                    now(),
+                    f"ثبت خرید فاکتور {invoice_id}",
+                    invoice_id,
+                    now(),
+                ),
+            )
 
-            journal_entry_id = journal_cur.lastrowid
+            journal_id = journal_cursor.lastrowid
 
-            # Inventory / Purchase debit
-            conn.execute("""
+            # موجودی کالا
+            conn.execute(
+                """
                 INSERT INTO journal_lines
                 (
                     journal_entry_id,
@@ -273,31 +225,30 @@ class PurchaseService:
                     credit
                 )
                 VALUES (?, ?, ?, ?, ?)
-            """, (
-                journal_entry_id,
-                "1401",
-                "موجودی کالا",
-                total,
-                0
-            ))
+                """,
+                (
+                    journal_id,
+                    "1401",
+                    "موجودی کالا",
+                    total,
+                    0,
+                ),
+            )
 
-            # Credit side
             if payment_method == "cash":
-
-                credit_code = "1101"
-                credit_name = "صندوق"
+                account_code = "1101"
+                account_name = "صندوق"
 
             elif payment_method == "bank":
-
-                credit_code = "1102"
-                credit_name = "بانک"
+                account_code = "1102"
+                account_name = "بانک"
 
             else:
+                account_code = "2101"
+                account_name = "حساب‌های پرداختنی"
 
-                credit_code = "2101"
-                credit_name = "حساب‌های پرداختنی"
-
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO journal_lines
                 (
                     journal_entry_id,
@@ -307,104 +258,42 @@ class PurchaseService:
                     credit
                 )
                 VALUES (?, ?, ?, ?, ?)
-            """, (
-                journal_entry_id,
-                credit_code,
-                credit_name,
-                0,
-                total
-            ))
-
-            conn.commit()
-
-            return {
-                "invoice_id": invoice_id,
-                "supplier_id": supplier_id,
-                "subtotal": subtotal,
-                "discount": int(discount),
-                "tax": int(tax),
-                "total": total,
-                "payment_method": payment_method,
-                "items": validated_items
-            }
-
-        except Exception:
-            conn.rollback()
-            raise
-
-        finally:
-            conn.close()
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def get_purchase(invoice_id):
-
-    conn = get_connection()
-
-    try:
-
-        invoice = conn.execute("""
-            SELECT
-                i.*,
-                s.name AS supplier_name,
-                s.phone AS supplier_phone
-            FROM invoices i
-            LEFT JOIN suppliers s
-                ON s.id = i.supplier_id
-            WHERE i.id = ?
-              AND i.invoice_type = 'purchase'
-        """, (
-            invoice_id,
-        )).fetchone()
-
-        if not invoice:
-            return None
-
-        items = conn.execute("""
-            SELECT
-                ii.*,
-                p.name AS product_name,
-                p.unit
-            FROM invoice_items ii
-            JOIN products p
-                ON p.id = ii.product_id
-            WHERE ii.invoice_id = ?
-            ORDER BY ii.id
-        """, (
-            invoice_id,
-        )).fetchall()
+                """,
+                (
+                    journal_id,
+                    account_code,
+                    account_name,
+                    0,
+                    total,
+                ),
+            )
 
         return {
-            "invoice": invoice,
-            "items": items
+            "invoice_id": invoice_id,
+            "supplier_id": supplier_id,
+            "supplier_name": supplier["name"],
+            "subtotal": subtotal,
+            "discount": discount,
+            "tax": tax,
+            "total": total,
+            "payment_method": payment_method,
         }
 
-    finally:
-        conn.close()
+    @staticmethod
+    def get_purchase(invoice_id):
+        result = get_invoice(invoice_id)
 
+        if not result["invoice"]:
+            return None
 
-def list_purchases(limit=20):
+        if result["invoice"]["invoice_type"] != "purchase":
+            return None
 
-    conn = get_connection()
+        return result
 
-    try:
-
-        return conn.execute("""
-            SELECT
-                i.*,
-                s.name AS supplier_name
-            FROM invoices i
-            LEFT JOIN suppliers s
-                ON s.id = i.supplier_id
-            WHERE i.invoice_type = 'purchase'
-            ORDER BY i.id DESC
-            LIMIT ?
-        """, (
-            limit,
-        )).fetchall()
-
-    finally:
-        conn.close()
+    @staticmethod
+    def list_purchases(limit=20):
+        return list_invoices(
+            invoice_type="purchase",
+            limit=limit,
+        )
