@@ -1,93 +1,144 @@
-from .db import post_journal
+from dataclasses import dataclass
 
 
-class AccountingEngine:
-    ACCOUNTS = {
-        "cash": ("1101", "صندوق"),
-        "bank": ("1102", "بانک"),
-        "receivable": ("1201", "حساب‌های دریافتنی"),
-        "inventory": ("1401", "موجودی کالا"),
-        "payable": ("2101", "حساب‌های پرداختنی"),
-        "sales": ("4101", "فروش"),
-        "cogs": ("5101", "بهای تمام‌شده کالای فروش‌رفته"),
-    }
+@dataclass(frozen=True)
+class Account:
+    code: str
+    name: str
+    nature: str
 
-    @classmethod
-    def line(cls, key, debit=0, credit=0):
-        code, name = cls.ACCOUNTS[key]
 
-        return {
-            "account_code": code,
-            "account_name": name,
-            "debit": debit,
-            "credit": credit,
-        }
+ACCOUNTS = {
+    "1101": Account(
+        code="1101",
+        name="صندوق",
+        nature="debit",
+    ),
 
-    @classmethod
-    def post_sale(
-        cls,
-        conn,
-        invoice_id,
-        total,
-        cogs,
+    "1102": Account(
+        code="1102",
+        name="بانک",
+        nature="debit",
+    ),
+
+    "1201": Account(
+        code="1201",
+        name="حساب‌های دریافتنی",
+        nature="debit",
+    ),
+
+    "1401": Account(
+        code="1401",
+        name="موجودی کالا",
+        nature="debit",
+    ),
+
+    "2101": Account(
+        code="2101",
+        name="حساب‌های پرداختنی",
+        nature="credit",
+    ),
+
+    "4101": Account(
+        code="4101",
+        name="فروش",
+        nature="credit",
+    ),
+
+    "5101": Account(
+        code="5101",
+        name="بهای تمام‌شده کالای فروش‌رفته",
+        nature="debit",
+    ),
+}
+
+
+def payment_account(method: str, sale: bool = True) -> str:
+    method = (method or "").lower().strip()
+
+    if method == "cash":
+        return "1101"
+
+    if method == "bank":
+        return "1102"
+
+    if sale:
+        return "1201"
+
+    return "2101"
+
+
+def purchase_payment_account(method: str) -> str:
+    method = (method or "").lower().strip()
+
+    if method == "cash":
+        return "1101"
+
+    if method == "bank":
+        return "1102"
+
+    return "2101"
+
+
+def sale_entry_lines(
+    total: int,
+    cost: int,
+    payment_method: str,
+):
+    payment_account_code = payment_account(
         payment_method,
-    ):
-        payment_account = {
-            "cash": "cash",
-            "bank": "bank",
-            "credit": "receivable",
-        }.get(payment_method)
+        sale=True,
+    )
 
-        if not payment_account:
-            raise ValueError("روش پرداخت نامعتبر است.")
+    lines = [
+        (
+            payment_account_code,
+            total,
+            0,
+        ),
+        (
+            "4101",
+            0,
+            total,
+        ),
+    ]
 
-        lines = [
-            cls.line(payment_account, debit=total),
-            cls.line("sales", credit=total),
-        ]
-
-        if cogs > 0:
-            lines.extend(
-                [
-                    cls.line("cogs", debit=cogs),
-                    cls.line("inventory", credit=cogs),
-                ]
-            )
-
-        return post_journal(
-            conn,
-            "ثبت فاکتور فروش",
-            "sale",
-            invoice_id,
-            lines,
+    if cost > 0:
+        lines.extend(
+            [
+                (
+                    "5101",
+                    cost,
+                    0,
+                ),
+                (
+                    "1401",
+                    0,
+                    cost,
+                ),
+            ]
         )
 
-    @classmethod
-    def post_purchase(
-        cls,
-        conn,
-        invoice_id,
-        total,
-        payment_method,
-    ):
-        payment_account = {
-            "cash": "cash",
-            "bank": "bank",
-            "credit": "payable",
-        }.get(payment_method)
+    return lines
 
-        if not payment_account:
-            raise ValueError("روش پرداخت نامعتبر است.")
 
-        lines = [
-            cls.line("inventory", debit=total),
-            cls.line(payment_account, credit=total),
-        ]
+def purchase_entry_lines(
+    total: int,
+    payment_method: str,
+):
+    payment_account_code = purchase_payment_account(
+        payment_method
+    )
 
-        return post_journal(
-            conn,
-            "ثبت فاکتور خرید",
-            "purchase",
-            invoice_id,
-            lines,
-        )
+    return [
+        (
+            "1401",
+            total,
+            0,
+        ),
+        (
+            payment_account_code,
+            0,
+            total,
+        ),
+    ]
