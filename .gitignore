@@ -2,7 +2,17 @@
 *.db
 *.sqlite
 *.sqlite3
+
 __pycache__/
 *.pyc
+*.pyo
+
 .venv/
 venv/
+env/
+
+.idea/
+.vscode/
+
+.DS_Store
+Thumbs.db
