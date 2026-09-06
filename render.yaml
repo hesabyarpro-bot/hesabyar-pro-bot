@@ -2,21 +2,29 @@ services:
   - type: web
     name: hesabyar-pro-bot
     runtime: python
+
     buildCommand: pip install -r requirements.txt
+
     startCommand: python -m app.main
 
     envVars:
       - key: BOT_TOKEN
         sync: false
 
-      - key: ADMIN_TELEGRAM_ID
-        value: "8806709666"
+      - key: ADMIN_ID
+        sync: false
 
       - key: CARD_NUMBER
         sync: false
 
-      - key: CARD_HOLDER
-        sync: false
+      - key: PLAN_MONTHLY
+        value: 199000
+
+      - key: PLAN_QUARTERLY
+        value: 499000
+
+      - key: DB_PATH
+        value: hesabyar.db
 
       - key: PORT
-        value: "10000"
+        value: 10000
