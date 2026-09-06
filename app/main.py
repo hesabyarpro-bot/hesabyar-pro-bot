@@ -8,6 +8,9 @@ from http.server import (
 
 from dotenv import load_dotenv
 
+from telegram import Update
+
+from .db import init_db
 from .bot import build_application
 
 
@@ -20,12 +23,9 @@ class HealthHandler(
 
     def do_GET(self):
 
-        if self.path in (
-            "/",
-            "/health",
+        if self.path.startswith(
+            "/health"
         ):
-
-            body = b"OK"
 
             self.send_response(200)
 
@@ -34,29 +34,27 @@ class HealthHandler(
                 "text/plain; charset=utf-8",
             )
 
-            self.send_header(
-                "Content-Length",
-                str(len(body)),
+            self.end_headers()
+
+            self.wfile.write(
+                b"OK"
             )
 
-            self.end_headers()
+            return
 
-            self.wfile.write(body)
+        self.send_response(404)
+        self.end_headers()
 
-        else:
-
-            self.send_response(404)
-            self.end_headers()
 
     def log_message(
         self,
-        format,
+        format_string,
         *args,
     ):
-        return
+        pass
 
 
-def start_health_server():
+def health_server():
 
     port = int(
         os.getenv(
@@ -78,30 +76,32 @@ def start_health_server():
 
 def main():
 
-    bot_token = os.getenv(
-        "BOT_TOKEN"
-    )
+    load_dotenv()
 
-    if not bot_token:
-        raise RuntimeError(
-            "BOT_TOKEN در Environment Variables "
-            "تنظیم نشده است."
-        )
+    init_db()
 
     thread = threading.Thread(
-        target=start_health_server,
+        target=health_server,
         daemon=True,
     )
 
     thread.start()
 
-    application = build_application()
+    token = os.getenv(
+        "BOT_TOKEN"
+    )
+
+    if not token:
+        raise RuntimeError(
+            "BOT_TOKEN تنظیم نشده است."
+        )
+
+    application = build_application(
+        token
+    )
 
     application.run_polling(
-        allowed_updates=[
-            "message",
-            "callback_query",
-        ]
+        allowed_updates=Update.ALL_TYPES
     )
 
 
