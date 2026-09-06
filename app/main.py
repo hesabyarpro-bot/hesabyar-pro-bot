@@ -3,22 +3,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler
 from app.db import init_db
-from app.bot import (
-    register_handlers,
-    start_command,
-)
-# =========================================================
-# بارگذاری تنظیمات محیطی
-# =========================================================
+from app.bot import register_handlers, start_command
 load_dotenv()
-# =========================================================
-# Health Check برای Render
-# =========================================================
+# =========================
+# Health Server
+# =========================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -38,10 +29,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 def start_health_server():
     port = int(
-        os.getenv(
-            "PORT",
-            "10000",
-        )
+        os.getenv("PORT", "10000")
     )
     server = HTTPServer(
         ("0.0.0.0", port),
@@ -51,67 +39,44 @@ def start_health_server():
         f"Health server running on port {port}"
     )
     server.serve_forever()
-# =========================================================
-# اجرای اصلی برنامه
-# =========================================================
+# =========================
+# Main
+# =========================
 def main():
-    bot_token = os.getenv(
-        "BOT_TOKEN"
-    )
+    bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise RuntimeError(
             "BOT_TOKEN environment variable is not configured."
         )
-    # -----------------------------------------------------
-    # ایجاد / به‌روزرسانی دیتابیس
-    # -----------------------------------------------------
+    # دیتابیس
     init_db()
     print(
         "Database initialized successfully."
     )
-    # -----------------------------------------------------
-    # اجرای Health Server
-    # -----------------------------------------------------
-    health_thread = threading.Thread(
+    # Health endpoint
+    threading.Thread(
         target=start_health_server,
         daemon=True,
-    )
-    health_thread.start()
-    # -----------------------------------------------------
-    # ساخت Telegram Application
-    # -----------------------------------------------------
+    ).start()
+    # Telegram Bot
     application = (
         ApplicationBuilder()
         .token(bot_token)
         .concurrent_updates(False)
         .build()
     )
-    # -----------------------------------------------------
-    # دستور /start
-    # -----------------------------------------------------
     application.add_handler(
         CommandHandler(
             "start",
             start_command,
         )
     )
-    # -----------------------------------------------------
-    # سایر Handlerهای ربات
-    # -----------------------------------------------------
-    register_handlers(
-        application
-    )
-    # -----------------------------------------------------
-    # شروع ربات
-    # -----------------------------------------------------
+    register_handlers(application)
     print(
         "HesabYar Pro Bot is starting..."
     )
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
-# =========================================================
-# Entry Point
-# =========================================================
 if __name__ == "__main__":
     main()
