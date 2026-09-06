@@ -1,5 +1,4 @@
 import os
-from datetime import date, timedelta
 
 from telegram import (
     Update,
@@ -7,802 +6,257 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
 )
+
 from telegram.ext import (
-    ContextTypes,
+    Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ConversationHandler,
+    ContextTypes,
     filters,
 )
 
-from app.db import (
-    upsert_telegram_user,
-    get_telegram_user,
-    get_subscription_status,
-    create_subscription_payment,
-    attach_receipt_to_payment,
-    get_payment,
-    get_pending_payments,
-    approve_subscription_payment,
-    reject_subscription_payment,
-    list_customers,
-    list_products,
-    list_suppliers,
-    create_customer,
-    create_product,
-    create_supplier,
-    get_stock_report,
-    get_low_stock_products,
-    get_invoice,
-    list_invoices,
-    get_last_journal_for_invoice,
+from . import db
+from .sales import SalesService
+from .purchases import PurchaseService
+from .reports import (
+    dashboard_text,
+    stock_text,
+    low_stock_text,
+    invoices_text,
 )
 
-from app.purchases import PurchaseService
 
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-ADMIN_TELEGRAM_ID = int(
-    os.getenv("ADMIN_TELEGRAM_ID", "8806709666")
+ADMIN_ID = int(
+    os.getenv(
+        "ADMIN_ID",
+        "0",
+    )
 )
+
 
 CARD_NUMBER = os.getenv(
     "CARD_NUMBER",
-    "شماره کارت در تنظیمات Render وارد نشده"
-)
-
-CARD_HOLDER = os.getenv(
-    "CARD_HOLDER",
-    "نام صاحب کارت در تنظیمات Render وارد نشده"
-)
-
-SUBSCRIPTION_MONTHLY_PRICE = int(
-    os.getenv("SUBSCRIPTION_MONTHLY_PRICE", "0")
-)
-
-SUBSCRIPTION_MONTHLY_DAYS = int(
-    os.getenv("SUBSCRIPTION_MONTHLY_DAYS", "30")
+    "",
 )
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+PLANS = {
+    "monthly": (
+        "اشتراک ماهانه",
+        30,
+        int(
+            os.getenv(
+                "PLAN_MONTHLY",
+                "199000",
+            )
+        ),
+    ),
 
-def normalize_digits(text):
-    if text is None:
-        return ""
+    "quarterly": (
+        "اشتراک سه‌ماهه",
+        90,
+        int(
+            os.getenv(
+                "PLAN_QUARTERLY",
+                "499000",
+            )
+        ),
+    ),
+}
 
-    mapping = str.maketrans(
-        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-        "01234567890123456789",
+
+MENU = [
+    [
+        "🛒 ثبت فروش",
+        "🧾 ثبت خرید",
+    ],
+
+    [
+        "📦 کالاها",
+        "👥 مشتریان",
+    ],
+
+    [
+        "🏭 تأمین‌کنندگان",
+        "📊 گزارش‌ها",
+    ],
+
+    [
+        "💳 خرید اشتراک",
+        "👨‍💼 پشتیبانی",
+    ],
+]
+
+
+if ADMIN_ID:
+    MENU.append(
+        [
+            "⚙️ پنل مدیریت"
+        ]
     )
 
-    return str(text).translate(mapping)
 
+def main_keyboard():
 
-def parse_float(text):
-    text = normalize_digits(text)
-    text = text.replace(",", "").replace("٬", "").strip()
-
-    return float(text)
-
-
-def parse_int(text):
-    return int(parse_float(text))
+    return ReplyKeyboardMarkup(
+        MENU,
+        resize_keyboard=True,
+    )
 
 
 def money(value):
-    try:
-        value = float(value)
-    except Exception:
-        value = 0
 
-    return f"{value:,.0f}"
-
-
-def is_admin(update):
-    user = update.effective_user
-
-    return bool(
-        user and user.id == ADMIN_TELEGRAM_ID
+    return (
+        f"{int(value):,}"
+        " تومان"
     )
 
 
-def main_menu(update):
-    buttons = [
-        ["🛒 ثبت فروش", "🧾 ثبت خرید"],
-        ["👥 مشتریان", "📦 کالاها"],
-        ["🚚 تأمین‌کنندگان", "📊 گزارش‌ها"],
-        ["💳 خرید اشتراک", "⚙️ وضعیت اشتراک"],
-        ["📋 فاکتورها", "👨‍💼 پشتیبانی"],
-    ]
+def parse_amount(text):
 
-    if is_admin(update):
-        buttons.append(["⚙️ پنل مدیریت"])
-
-    return ReplyKeyboardMarkup(
-        buttons,
-        resize_keyboard=True,
+    return int(
+        text
+        .replace(",", "")
+        .replace("٬", "")
+        .replace("تومان", "")
+        .strip()
     )
+
+
+def reset_user_data(
+    context
+):
+
+    context.user_data.clear()
 
 
 # =========================================================
 # START
 # =========================================================
 
-async def start_command(
+async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user = update.effective_user
 
-    upsert_telegram_user(
-        telegram_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
+    db.upsert_telegram_user(
+        update.effective_user
     )
+
+    subscription = db.active_subscription(
+        update.effective_user.id
+    )
+
+    if subscription:
+
+        subscription_text = (
+            "\n\n"
+            f"✅ اشتراک فعال: "
+            f"{subscription['plan_name']}\n"
+            f"تا تاریخ: "
+            f"{subscription['end_date']}"
+        )
+
+    else:
+
+        subscription_text = (
+            "\n\n"
+            "⚠️ اشتراک فعالی ندارید."
+        )
 
     await update.message.reply_text(
-        "سلام 👋\n"
-        "به «حساب‌یار پرو» خوش آمدید.\n\n"
-        "حسابداری حرفه‌ای، ساده و همیشه در دسترس",
-        reply_markup=main_menu(update),
+
+        "سلام 👋\n\n"
+
+        "به حساب‌یار پرو خوش آمدید.\n\n"
+
+        "حسابداری حرفه‌ای، ساده و "
+        "همیشه در دسترس."
+
+        + subscription_text,
+
+        reply_markup=main_keyboard(),
     )
 
 
-async def menu_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# =========================================================
+# GENERAL MENU
+# =========================================================
+
+async def main_menu(
+    update,
+    context,
 ):
+
     text = update.message.text
 
-    if text == "🧾 ثبت خرید":
-        await purchase_start(update, context)
-        return
-
     if text == "🛒 ثبت فروش":
-        await sale_start(update, context)
-        return
+        return await sales_start(
+            update,
+            context,
+        )
 
-    if text == "👥 مشتریان":
-        await customers_menu(update, context)
-        return
+    if text == "🧾 ثبت خرید":
+        return await purchase_start(
+            update,
+            context,
+        )
 
     if text == "📦 کالاها":
-        await products_menu(update, context)
-        return
+        return await products_menu(
+            update,
+            context,
+        )
 
-    if text == "🚚 تأمین‌کنندگان":
-        await suppliers_menu(update, context)
-        return
+    if text == "👥 مشتریان":
+        return await customers_menu(
+            update,
+            context,
+        )
+
+    if text == "🏭 تأمین‌کنندگان":
+        return await suppliers_menu(
+            update,
+            context,
+        )
 
     if text == "📊 گزارش‌ها":
-        await reports_menu(update, context)
-        return
-
-    if text == "📋 فاکتورها":
-        await invoices_menu(update, context)
-        return
+        return await reports_menu(
+            update,
+            context,
+        )
 
     if text == "💳 خرید اشتراک":
-        await subscription_start(update, context)
-        return
-
-    if text == "⚙️ وضعیت اشتراک":
-        await subscription_status(update, context)
-        return
+        return await subscription_menu(
+            update,
+            context,
+        )
 
     if text == "👨‍💼 پشتیبانی":
-        await support(update, context)
+
+        await update.message.reply_text(
+            "👨‍💼 پشتیبانی حساب‌یار پرو\n\n"
+            "پیام خود را ارسال کنید."
+        )
+
         return
 
-    if text == "⚙️ پنل مدیریت":
-        await admin_panel(update, context)
-        return
-
-
-# =========================================================
-# PURCHASE
-# =========================================================
-
-(
-    PURCHASE_SUPPLIER,
-    PURCHASE_PRODUCT,
-    PURCHASE_QUANTITY,
-    PURCHASE_PRICE,
-    PURCHASE_DISCOUNT,
-    PURCHASE_PAYMENT,
-    PURCHASE_CONFIRM,
-) = range(7)
-
-
-async def purchase_start(
-    update,
-    context,
-):
-    suppliers = list_suppliers()
-
-    if not suppliers:
-        await update.message.reply_text(
-            "هیچ تأمین‌کننده‌ای ثبت نشده است."
-        )
-        return ConversationHandler.END
-
-    keyboard = []
-
-    for supplier in suppliers:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    supplier["name"],
-                    callback_data=f"pur_supplier:{supplier['id']}",
-                )
-            ]
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ]
-    )
-
-    context.user_data["purchase"] = {
-        "items": [],
-        "discount": 0,
-        "tax": 0,
-    }
-
-    await update.message.reply_text(
-        "تأمین‌کننده را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_SUPPLIER
-
-
-async def purchase_supplier_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "pur_cancel":
-        await query.edit_message_text(
-            "ثبت خرید لغو شد."
-        )
-        return ConversationHandler.END
-
-    supplier_id = int(
-        query.data.split(":")[1]
-    )
-
-    context.user_data["purchase"]["supplier_id"] = supplier_id
-
-    products = list_products()
-
-    keyboard = []
-
-    for product in products:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"{product['name']} | موجودی: {product['stock']}",
-                    callback_data=f"pur_product:{product['id']}",
-                )
-            ]
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ]
-    )
-
-    await query.edit_message_text(
-        "کالا را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_PRODUCT
-
-
-async def purchase_product_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "pur_cancel":
-        await query.edit_message_text(
-            "ثبت خرید لغو شد."
-        )
-        return ConversationHandler.END
-
-    product_id = int(
-        query.data.split(":")[1]
-    )
-
-    product = next(
-        (
-            p
-            for p in list_products()
-            if p["id"] == product_id
-        ),
-        None,
-    )
-
-    if not product:
-        await query.edit_message_text(
-            "کالا پیدا نشد."
-        )
-        return ConversationHandler.END
-
-    context.user_data["purchase"]["current_product_id"] = product_id
-    context.user_data["purchase"]["current_product_name"] = product["name"]
-
-    await query.message.reply_text(
-        f"کالا: {product['name']}\n\n"
-        "تعداد را وارد کنید:"
-    )
-
-    return PURCHASE_QUANTITY
-
-
-async def purchase_quantity(
-    update,
-    context,
-):
-    try:
-        quantity = parse_float(
-            update.message.text
-        )
-
-        if quantity <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text(
-            "❌ تعداد نامعتبر است.\nمثلاً: 5"
-        )
-        return PURCHASE_QUANTITY
-
-    context.user_data["purchase"]["quantity"] = quantity
-
-    await update.message.reply_text(
-        "قیمت خرید هر واحد را به تومان وارد کنید:"
-    )
-
-    return PURCHASE_PRICE
-
-
-async def purchase_price(
-    update,
-    context,
-):
-    try:
-        price = parse_float(
-            update.message.text
-        )
-
-        if price < 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text(
-            "❌ قیمت نامعتبر است."
-        )
-        return PURCHASE_PRICE
-
-    context.user_data["purchase"]["unit_price"] = price
-
-    await update.message.reply_text(
-        "تخفیف این قلم را وارد کنید.\n"
-        "اگر تخفیف ندارد، 0 بزنید:"
-    )
-
-    return PURCHASE_DISCOUNT
-
-
-async def purchase_discount(
-    update,
-    context,
-):
-    try:
-        discount = parse_float(
-            update.message.text
-        )
-
-        if discount < 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text(
-            "❌ مبلغ تخفیف نامعتبر است."
-        )
-        return PURCHASE_DISCOUNT
-
-    purchase = context.user_data["purchase"]
-
-    purchase["items"].append(
-        {
-            "product_id": purchase["current_product_id"],
-            "quantity": purchase["quantity"],
-            "unit_price": purchase["unit_price"],
-            "discount": discount,
-        }
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ افزودن کالای دیگر",
-                callback_data="pur_add_item",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "➡️ ادامه ثبت خرید",
-                callback_data="pur_continue",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ],
-    ]
-
-    await update.message.reply_text(
-        "قلم کالا ثبت شد.\n\n"
-        "می‌توانید کالای دیگری اضافه کنید یا ادامه دهید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_PRODUCT
-
-
-async def purchase_add_item_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    products = list_products()
-
-    keyboard = []
-
-    for product in products:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    product["name"],
-                    callback_data=f"pur_product:{product['id']}",
-                )
-            ]
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ]
-    )
-
-    await query.edit_message_text(
-        "کالای بعدی را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_PRODUCT
-
-
-async def purchase_continue_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    purchase = context.user_data["purchase"]
-
-    lines = []
-    subtotal = 0
-
-    for index, item in enumerate(
-        purchase["items"],
-        start=1,
+    if (
+        text == "⚙️ پنل مدیریت"
+        and update.effective_user.id
+        == ADMIN_ID
     ):
-        product = next(
-            (
-                p
-                for p in list_products()
-                if p["id"] == item["product_id"]
-            ),
-            None,
+
+        return await admin_menu(
+            update,
+            context,
         )
-
-        name = (
-            product["name"]
-            if product
-            else "کالای نامشخص"
-        )
-
-        line_total = (
-            item["quantity"] * item["unit_price"]
-            - item["discount"]
-        )
-
-        subtotal += line_total
-
-        lines.append(
-            f"{index}. {name}\n"
-            f"   تعداد: {item['quantity']}\n"
-            f"   مبلغ: {money(line_total)} تومان"
-        )
-
-    purchase["subtotal"] = subtotal
-
-    text = (
-        "📋 پیش‌فاکتور خرید\n\n"
-        + "\n".join(lines)
-        + "\n\n"
-        f"جمع: {money(subtotal)} تومان\n\n"
-        "روش پرداخت را انتخاب کنید:"
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "💵 نقدی",
-                callback_data="pur_pay:cash",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🏦 بانکی",
-                callback_data="pur_pay:bank",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📒 نسیه / پرداختنی",
-                callback_data="pur_pay:credit",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ],
-    ]
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_PAYMENT
-
-
-async def purchase_payment_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "pur_cancel":
-        await query.edit_message_text(
-            "ثبت خرید لغو شد."
-        )
-        return ConversationHandler.END
-
-    payment_method = query.data.split(":")[1]
-
-    context.user_data["purchase"]["payment_method"] = payment_method
-
-    purchase = context.user_data["purchase"]
-
-    payment_name = {
-        "cash": "نقدی",
-        "bank": "بانکی",
-        "credit": "نسیه / پرداختنی",
-    }.get(
-        payment_method,
-        payment_method,
-    )
-
-    total = purchase["subtotal"]
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ تأیید و ثبت خرید",
-                callback_data="pur_confirm",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو",
-                callback_data="pur_cancel",
-            )
-        ],
-    ]
-
-    await query.edit_message_text(
-        "آیا اطلاعات خرید صحیح است؟\n\n"
-        f"جمع خرید: {money(total)} تومان\n"
-        f"روش پرداخت: {payment_name}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    return PURCHASE_CONFIRM
-
-
-async def purchase_confirm_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "pur_cancel":
-        await query.edit_message_text(
-            "ثبت خرید لغو شد."
-        )
-        context.user_data.pop("purchase", None)
-        return ConversationHandler.END
-
-    purchase = context.user_data["purchase"]
-
-    try:
-        result = PurchaseService.create_purchase(
-            supplier_id=purchase["supplier_id"],
-            items=purchase["items"],
-            discount=purchase.get("discount", 0),
-            tax=purchase.get("tax", 0),
-            payment_method=purchase.get(
-                "payment_method",
-                "credit",
-            ),
-        )
-
-        await query.edit_message_text(
-            "✅ خرید با موفقیت ثبت شد.\n\n"
-            f"شماره فاکتور: {result['invoice_id']}\n"
-            f"تأمین‌کننده: {result['supplier_name']}\n"
-            f"جمع خرید: {money(result['total'])} تومان\n\n"
-            "موجودی کالا و سند حسابداری نیز ثبت شد."
-        )
-
-    except Exception as exc:
-        await query.edit_message_text(
-            "❌ ثبت خرید انجام نشد.\n\n"
-            f"خطا: {exc}"
-        )
-
-    context.user_data.pop("purchase", None)
-
-    return ConversationHandler.END
-
-
-async def purchase_cancel(
-    update,
-    context,
-):
-    context.user_data.pop("purchase", None)
 
     await update.message.reply_text(
-        "ثبت خرید لغو شد.",
-        reply_markup=main_menu(update),
-    )
-
-    return ConversationHandler.END
-
-
-# =========================================================
-# CUSTOMERS
-# =========================================================
-
-async def customers_menu(
-    update,
-    context,
-):
-    customers = list_customers()
-
-    text = "👥 مشتریان\n\n"
-
-    if not customers:
-        text += "هنوز مشتری‌ای ثبت نشده است."
-    else:
-        for customer in customers[:30]:
-            text += (
-                f"#{customer['id']} - "
-                f"{customer['name']}\n"
-            )
-
-            if customer["phone"]:
-                text += f"📞 {customer['phone']}\n"
-
-            text += "\n"
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ مشتری جدید",
-                callback_data="customer_add",
-            )
-        ]
-    ]
-
-    await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def customer_add_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    context.user_data["customer_add"] = True
-
-    await query.message.reply_text(
-        "نام مشتری جدید را وارد کنید:"
-    )
-
-
-async def customer_add_text(
-    update,
-    context,
-):
-    if not context.user_data.get(
-        "customer_add"
-    ):
-        return
-
-    name = update.message.text.strip()
-
-    if not name:
-        await update.message.reply_text(
-            "نام مشتری نمی‌تواند خالی باشد."
-        )
-        return
-
-    customer_id = create_customer(
-        name=name,
-        phone="",
-        address="",
-    )
-
-    context.user_data.pop(
-        "customer_add",
-        None,
-    )
-
-    await update.message.reply_text(
-        "✅ مشتری ثبت شد.\n\n"
-        f"شماره مشتری: {customer_id}",
-        reply_markup=main_menu(update),
+        "از منوی زیر یک گزینه را انتخاب کنید.",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -814,99 +268,101 @@ async def products_menu(
     update,
     context,
 ):
-    products = list_products()
 
-    text = "📦 کالاها\n\n"
+    products = db.list_products()
 
-    if not products:
-        text += "هنوز کالایی ثبت نشده است."
-    else:
-        for product in products[:30]:
-            text += (
-                f"#{product['id']} - {product['name']}\n"
-                f"کد: {product['code'] or '-'}\n"
-                f"موجودی: {product['stock']}\n"
-                f"قیمت خرید: {money(product['purchase_cost'])}\n"
-                f"قیمت فروش: {money(product['sale_price'])}\n\n"
-            )
+    if products:
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ کالای جدید",
-                callback_data="product_add",
-            )
+        lines = [
+            "📦 کالاها",
+            "",
         ]
-    ]
+
+        for product in products:
+
+            lines.append(
+                f"• {product['code']} | "
+                f"{product['name']}\n"
+                f"  موجودی: "
+                f"{product['stock']:g} "
+                f"{product['unit']}\n"
+                f"  قیمت فروش: "
+                f"{money(product['sale_price'])}"
+            )
+
+        text = "\n".join(lines)
+
+    else:
+
+        text = (
+            "📦 هنوز کالایی ثبت نشده است."
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ کالای جدید",
+                    callback_data="new_product",
+                )
+            ]
+        ]
+    )
 
     await update.message.reply_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard,
     )
 
 
-async def product_add_callback(
+# =========================================================
+# CUSTOMERS
+# =========================================================
+
+async def customers_menu(
     update,
     context,
 ):
-    query = update.callback_query
-    await query.answer()
 
-    context.user_data["product_add"] = True
+    customers = db.list_customers()
 
-    await query.message.reply_text(
-        "اطلاعات کالا را در یک پیام ارسال کنید:\n\n"
-        "نام | کد | واحد | قیمت خرید | قیمت فروش | حداقل موجودی\n\n"
-        "مثال:\n"
-        "لپ‌تاپ | P002 | دستگاه | 30000000 | 35000000 | 2"
-    )
+    if customers:
 
+        lines = [
+            "👥 مشتریان",
+            "",
+        ]
 
-async def product_add_text(
-    update,
-    context,
-):
-    if not context.user_data.get(
-        "product_add"
-    ):
-        return
+        for customer in customers:
 
-    parts = [
-        x.strip()
-        for x in update.message.text.split("|")
-    ]
+            lines.append(
+                f"• {customer['id']} | "
+                f"{customer['name']} | "
+                f"{customer['phone'] or '-'}"
+            )
 
-    if len(parts) != 6:
-        await update.message.reply_text(
-            "فرمت صحیح نیست.\n"
-            "لطفاً ۶ بخش را با | جدا کنید."
+        text = "\n".join(lines)
+
+    else:
+
+        text = (
+            "👥 هنوز مشتری ثبت نشده است."
         )
-        return
 
-    try:
-        product_id = create_product(
-            name=parts[0],
-            code=parts[1],
-            unit=parts[2],
-            purchase_cost=parse_float(parts[3]),
-            sale_price=parse_float(parts[4]),
-            min_stock=parse_float(parts[5]),
-        )
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ ثبت کالا انجام نشد:\n{exc}"
-        )
-        return
-
-    context.user_data.pop(
-        "product_add",
-        None,
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ مشتری جدید",
+                    callback_data="new_customer",
+                )
+            ]
+        ]
     )
 
     await update.message.reply_text(
-        "✅ کالا ثبت شد.\n\n"
-        f"شماره کالا: {product_id}",
-        reply_markup=main_menu(update),
+        text,
+        reply_markup=keyboard,
     )
 
 
@@ -918,86 +374,1308 @@ async def suppliers_menu(
     update,
     context,
 ):
-    suppliers = list_suppliers()
 
-    text = "🚚 تأمین‌کنندگان\n\n"
+    suppliers = db.list_suppliers()
 
-    if not suppliers:
-        text += "هنوز تأمین‌کننده‌ای ثبت نشده است."
-    else:
-        for supplier in suppliers[:30]:
-            text += (
-                f"#{supplier['id']} - "
-                f"{supplier['name']}\n"
-            )
+    if suppliers:
 
-            if supplier["phone"]:
-                text += f"📞 {supplier['phone']}\n"
-
-            text += "\n"
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "➕ تأمین‌کننده جدید",
-                callback_data="supplier_add",
-            )
+        lines = [
+            "🏭 تأمین‌کنندگان",
+            "",
         ]
-    ]
+
+        for supplier in suppliers:
+
+            lines.append(
+                f"• {supplier['id']} | "
+                f"{supplier['name']} | "
+                f"{supplier['phone'] or '-'}"
+            )
+
+        text = "\n".join(lines)
+
+    else:
+
+        text = (
+            "🏭 هنوز تأمین‌کننده ثبت نشده است."
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ تأمین‌کننده جدید",
+                    callback_data="new_supplier",
+                )
+            ]
+        ]
+    )
 
     await update.message.reply_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard,
     )
 
 
-async def supplier_add_callback(
+# =========================================================
+# MASTER DATA CREATION
+# =========================================================
+
+async def master_callback(
     update,
     context,
 ):
+
     query = update.callback_query
+
     await query.answer()
 
-    context.user_data["supplier_add"] = True
+    data = query.data
 
-    await query.message.reply_text(
-        "نام تأمین‌کننده جدید را وارد کنید:"
-    )
+    if data == "new_customer":
+
+        context.user_data[
+            "master_type"
+        ] = "customer"
+
+        context.user_data[
+            "master_step"
+        ] = 1
+
+        await query.message.reply_text(
+            "نام مشتری را ارسال کنید:"
+        )
+
+        return "MASTER"
 
 
-async def supplier_add_text(
+    if data == "new_supplier":
+
+        context.user_data[
+            "master_type"
+        ] = "supplier"
+
+        context.user_data[
+            "master_step"
+        ] = 1
+
+        await query.message.reply_text(
+            "نام تأمین‌کننده را ارسال کنید:"
+        )
+
+        return "MASTER"
+
+
+    if data == "new_product":
+
+        context.user_data[
+            "master_type"
+        ] = "product"
+
+        context.user_data[
+            "master_step"
+        ] = 1
+
+        await query.message.reply_text(
+            "کد کالا را ارسال کنید:"
+        )
+
+        return "MASTER"
+
+
+    return ConversationHandler.END
+
+
+async def master_text(
     update,
     context,
 ):
-    if not context.user_data.get(
-        "supplier_add"
-    ):
-        return
 
-    name = update.message.text.strip()
+    value = update.message.text.strip()
 
-    if not name:
-        await update.message.reply_text(
-            "نام تأمین‌کننده نمی‌تواند خالی باشد."
-        )
-        return
-
-    supplier_id = create_supplier(
-        name=name,
-        phone="",
-        address="",
+    master_type = context.user_data.get(
+        "master_type"
     )
 
+    step = context.user_data.get(
+        "master_step",
+        1,
+    )
+
+
+    # -----------------------------------------------------
+    # CUSTOMER
+    # -----------------------------------------------------
+
+    if master_type == "customer":
+
+        if step == 1:
+
+            context.user_data[
+                "master_name"
+            ] = value
+
+            context.user_data[
+                "master_step"
+            ] = 2
+
+            await update.message.reply_text(
+                "شماره تماس مشتری را ارسال کنید "
+                "یا - بزنید:"
+            )
+
+            return "MASTER"
+
+
+        if step == 2:
+
+            name = context.user_data[
+                "master_name"
+            ]
+
+            phone = (
+                ""
+                if value == "-"
+                else value
+            )
+
+            db.add_customer(
+                name=name,
+                phone=phone,
+            )
+
+            reset_user_data(
+                context
+            )
+
+            await update.message.reply_text(
+                "✅ مشتری با موفقیت ثبت شد.",
+                reply_markup=main_keyboard(),
+            )
+
+            return ConversationHandler.END
+
+
+    # -----------------------------------------------------
+    # SUPPLIER
+    # -----------------------------------------------------
+
+    if master_type == "supplier":
+
+        if step == 1:
+
+            context.user_data[
+                "master_name"
+            ] = value
+
+            context.user_data[
+                "master_step"
+            ] = 2
+
+            await update.message.reply_text(
+                "شماره تماس تأمین‌کننده را "
+                "ارسال کنید یا - بزنید:"
+            )
+
+            return "MASTER"
+
+
+        if step == 2:
+
+            name = context.user_data[
+                "master_name"
+            ]
+
+            phone = (
+                ""
+                if value == "-"
+                else value
+            )
+
+            db.add_supplier(
+                name=name,
+                phone=phone,
+            )
+
+            reset_user_data(
+                context
+            )
+
+            await update.message.reply_text(
+                "✅ تأمین‌کننده با موفقیت ثبت شد.",
+                reply_markup=main_keyboard(),
+            )
+
+            return ConversationHandler.END
+
+
+    # -----------------------------------------------------
+    # PRODUCT
+    # -----------------------------------------------------
+
+    if master_type == "product":
+
+        fields = [
+            "code",
+            "name",
+            "unit",
+            "sale_price",
+            "purchase_cost",
+            "min_stock",
+        ]
+
+        field = fields[
+            step - 1
+        ]
+
+        context.user_data[
+            field
+        ] = value
+
+        if step < len(fields):
+
+            context.user_data[
+                "master_step"
+            ] = step + 1
+
+            prompts = {
+                1: "نام کالا را ارسال کنید:",
+
+                2: (
+                    "واحد کالا را ارسال کنید "
+                    "(مثلاً عدد، کیلو، متر):"
+                ),
+
+                3: (
+                    "قیمت فروش واحد را "
+                    "به تومان ارسال کنید:"
+                ),
+
+                4: (
+                    "قیمت خرید واحد را "
+                    "به تومان ارسال کنید:"
+                ),
+
+                5: (
+                    "حداقل موجودی را "
+                    "ارسال کنید:"
+                ),
+            }
+
+            await update.message.reply_text(
+                prompts[step]
+            )
+
+            return "MASTER"
+
+
+        try:
+
+            db.add_product(
+                code=context.user_data[
+                    "code"
+                ],
+
+                name=context.user_data[
+                    "name"
+                ],
+
+                unit=context.user_data[
+                    "unit"
+                ],
+
+                sale_price=parse_amount(
+                    context.user_data[
+                        "sale_price"
+                    ]
+                ),
+
+                purchase_cost=parse_amount(
+                    context.user_data[
+                        "purchase_cost"
+                    ]
+                ),
+
+                min_stock=float(
+                    context.user_data[
+                        "min_stock"
+                    ]
+                ),
+            )
+
+        except Exception as error:
+
+            await update.message.reply_text(
+                f"❌ ثبت کالا انجام نشد:\n"
+                f"{error}"
+            )
+
+            return ConversationHandler.END
+
+
+        reset_user_data(
+            context
+        )
+
+        await update.message.reply_text(
+            "✅ کالا با موفقیت ثبت شد.",
+            reply_markup=main_keyboard(),
+        )
+
+        return ConversationHandler.END
+
+
+    return ConversationHandler.END
+
+
+# =========================================================
+# SALES
+# =========================================================
+
+async def sales_start(
+    update,
+    context,
+):
+
+    customers = db.list_customers()
+
+    if not customers:
+
+        await update.message.reply_text(
+            "❌ ابتدا حداقل یک مشتری ثبت کنید."
+        )
+
+        return ConversationHandler.END
+
+
+    reset_user_data(
+        context
+    )
+
+    context.user_data[
+        "flow"
+    ] = "sale"
+
+    context.user_data[
+        "items"
+    ] = []
+
+
+    buttons = []
+
+    for customer in customers:
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    customer["name"],
+                    callback_data=(
+                        f"sale_customer:"
+                        f"{customer['id']}"
+                    ),
+                )
+            ]
+        )
+
+
+    await update.message.reply_text(
+        "👤 مشتری فاکتور را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+
+    return "SALE_CUSTOMER"
+
+
+async def sale_customer_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    customer_id = int(
+        query.data.split(":")[1]
+    )
+
+    context.user_data[
+        "party_id"
+    ] = customer_id
+
+    return await show_sale_products(
+        query.message,
+        context,
+    )
+
+
+async def show_sale_products(
+    message,
+    context,
+):
+
+    products = db.list_products()
+
+    if not products:
+
+        await message.reply_text(
+            "❌ ابتدا کالا ثبت کنید."
+        )
+
+        return ConversationHandler.END
+
+
+    buttons = []
+
+    for product in products:
+
+        label = (
+            f"{product['name']} | "
+            f"موجودی "
+            f"{product['stock']:g}"
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=(
+                        f"sale_product:"
+                        f"{product['id']}"
+                    ),
+                )
+            ]
+        )
+
+
+    await message.reply_text(
+        "📦 کالا را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+
+    return "SALE_PRODUCT"
+
+
+async def sale_product_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    product_id = int(
+        query.data.split(":")[1]
+    )
+
+    product = db.get_product(
+        product_id
+    )
+
+    if not product:
+
+        await query.message.reply_text(
+            "❌ کالا پیدا نشد."
+        )
+
+        return ConversationHandler.END
+
+
+    context.user_data[
+        "current_product"
+    ] = product_id
+
+    await query.message.reply_text(
+        f"📦 {product['name']}\n\n"
+        f"تعداد را وارد کنید:"
+    )
+
+    return "SALE_QTY"
+
+
+async def sale_qty(
+    update,
+    context,
+):
+
+    try:
+
+        quantity = float(
+            update.message.text
+        )
+
+        if quantity <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ تعداد نامعتبر است."
+        )
+
+        return "SALE_QTY"
+
+
+    product = db.get_product(
+        context.user_data[
+            "current_product"
+        ]
+    )
+
+    if quantity > product["stock"]:
+
+        await update.message.reply_text(
+            f"❌ موجودی کافی نیست.\n"
+            f"موجودی فعلی: "
+            f"{product['stock']:g}"
+        )
+
+        return "SALE_QTY"
+
+
+    context.user_data[
+        "current_qty"
+    ] = quantity
+
+
+    await update.message.reply_text(
+        "💰 قیمت فروش واحد را وارد کنید:\n\n"
+        f"قیمت فعلی: "
+        f"{money(product['sale_price'])}"
+    )
+
+    return "SALE_PRICE"
+
+
+async def sale_price(
+    update,
+    context,
+):
+
+    try:
+
+        price = parse_amount(
+            update.message.text
+        )
+
+        if price < 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ مبلغ نامعتبر است."
+        )
+
+        return "SALE_PRICE"
+
+
+    product_id = context.user_data[
+        "current_product"
+    ]
+
+    quantity = context.user_data[
+        "current_qty"
+    ]
+
+    product = db.get_product(
+        product_id
+    )
+
+    line_total = int(
+        round(
+            quantity * price
+        )
+    )
+
+
+    context.user_data[
+        "items"
+    ].append(
+        {
+            "product_id": product_id,
+            "qty": quantity,
+            "unit_price": price,
+            "discount": 0,
+            "tax": 0,
+            "line_total": line_total,
+        }
+    )
+
+
     context.user_data.pop(
-        "supplier_add",
+        "current_product",
         None,
     )
 
-    await update.message.reply_text(
-        "✅ تأمین‌کننده ثبت شد.\n\n"
-        f"شماره تأمین‌کننده: {supplier_id}",
-        reply_markup=main_menu(update),
+    context.user_data.pop(
+        "current_qty",
+        None,
     )
+
+
+    current_total = sum(
+        item["line_total"]
+        for item in context.user_data[
+            "items"
+        ]
+    )
+
+
+    await update.message.reply_text(
+
+        f"✅ {product['name']} اضافه شد.\n\n"
+
+        f"جمع فعلی: "
+        f"{money(current_total)}",
+
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ افزودن کالا",
+                        callback_data="sale_more",
+                    ),
+
+                    InlineKeyboardButton(
+                        "➡️ ادامه",
+                        callback_data="sale_continue",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+    return "SALE_ITEMS"
+
+
+async def sale_items_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.data == "sale_more":
+
+        return await show_sale_products(
+            query.message,
+            context,
+        )
+
+
+    await query.message.reply_text(
+        "روش پرداخت را انتخاب کنید:",
+        reply_markup=payment_keyboard(
+            "sale"
+        ),
+    )
+
+    return "SALE_PAYMENT"
+
+
+async def sale_payment_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    payment_method = (
+        query.data.split(":")[1]
+    )
+
+    context.user_data[
+        "payment"
+    ] = payment_method
+
+
+    names = {
+        "cash": "نقدی",
+        "bank": "کارت / بانک",
+        "credit": "نسیه / اعتباری",
+    }
+
+
+    lines = []
+
+    for item in context.user_data[
+        "items"
+    ]:
+
+        product = db.get_product(
+            item["product_id"]
+        )
+
+        lines.append(
+            f"• {product['name']} × "
+            f"{item['qty']:g} = "
+            f"{money(item['line_total'])}"
+        )
+
+
+    total = sum(
+        item["line_total"]
+        for item in context.user_data[
+            "items"
+        ]
+    )
+
+
+    text = (
+        "🧾 پیش‌نمایش فاکتور فروش\n\n"
+        + "\n".join(lines)
+        + "\n\n"
+        f"جمع کل: {money(total)}\n"
+        f"روش پرداخت: "
+        f"{names[payment_method]}\n\n"
+        "آیا ثبت نهایی شود؟"
+    )
+
+
+    await query.message.reply_text(
+
+        text,
+
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ تأیید و ثبت",
+                        callback_data="sale_confirm",
+                    ),
+
+                    InlineKeyboardButton(
+                        "❌ لغو",
+                        callback_data="cancel_flow",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+    return "SALE_CONFIRM"
+
+
+async def sale_confirm_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+
+    try:
+
+        (
+            invoice_id,
+            invoice_no,
+            total,
+            cost,
+        ) = SalesService.create_sale(
+            customer_id=context.user_data[
+                "party_id"
+            ],
+
+            items=context.user_data[
+                "items"
+            ],
+
+            payment_method=context.user_data[
+                "payment"
+            ],
+        )
+
+
+        reset_user_data(
+            context
+        )
+
+
+        await query.message.reply_text(
+
+            "✅ فروش با موفقیت ثبت شد.\n\n"
+
+            f"شماره فاکتور: "
+            f"{invoice_no}\n"
+
+            f"مبلغ فروش: "
+            f"{money(total)}\n"
+
+            f"بهای تمام‌شده: "
+            f"{money(cost)}",
+
+            reply_markup=main_keyboard(),
+        )
+
+
+    except Exception as error:
+
+        await query.message.reply_text(
+            f"❌ ثبت فروش انجام نشد:\n"
+            f"{error}",
+            reply_markup=main_keyboard(),
+        )
+
+
+    return ConversationHandler.END
+
+
+# =========================================================
+# PURCHASES
+# =========================================================
+
+async def purchase_start(
+    update,
+    context,
+):
+
+    suppliers = db.list_suppliers()
+
+    if not suppliers:
+
+        await update.message.reply_text(
+            "❌ ابتدا تأمین‌کننده ثبت کنید."
+        )
+
+        return ConversationHandler.END
+
+
+    reset_user_data(
+        context
+    )
+
+    context.user_data[
+        "flow"
+    ] = "purchase"
+
+    context.user_data[
+        "items"
+    ] = []
+
+
+    buttons = []
+
+    for supplier in suppliers:
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    supplier["name"],
+                    callback_data=(
+                        f"purchase_supplier:"
+                        f"{supplier['id']}"
+                    ),
+                )
+            ]
+        )
+
+
+    await update.message.reply_text(
+        "🏭 تأمین‌کننده را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+
+    return "PURCHASE_SUPPLIER"
+
+
+async def purchase_supplier_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    supplier_id = int(
+        query.data.split(":")[1]
+    )
+
+    context.user_data[
+        "party_id"
+    ] = supplier_id
+
+    return await show_purchase_products(
+        query.message,
+        context,
+    )
+
+
+async def show_purchase_products(
+    message,
+    context,
+):
+
+    products = db.list_products()
+
+    if not products:
+
+        await message.reply_text(
+            "❌ ابتدا کالا ثبت کنید."
+        )
+
+        return ConversationHandler.END
+
+
+    buttons = []
+
+    for product in products:
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    product["name"],
+                    callback_data=(
+                        f"purchase_product:"
+                        f"{product['id']}"
+                    ),
+                )
+            ]
+        )
+
+
+    await message.reply_text(
+        "📦 کالای خرید را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+
+    return "PURCHASE_PRODUCT"
+
+
+async def purchase_product_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    product_id = int(
+        query.data.split(":")[1]
+    )
+
+    product = db.get_product(
+        product_id
+    )
+
+    if not product:
+
+        await query.message.reply_text(
+            "❌ کالا پیدا نشد."
+        )
+
+        return ConversationHandler.END
+
+
+    context.user_data[
+        "current_product"
+    ] = product_id
+
+
+    await query.message.reply_text(
+        f"📦 {product['name']}\n\n"
+        "تعداد را وارد کنید:"
+    )
+
+    return "PURCHASE_QTY"
+
+
+async def purchase_qty(
+    update,
+    context,
+):
+
+    try:
+
+        quantity = float(
+            update.message.text
+        )
+
+        if quantity <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ تعداد نامعتبر است."
+        )
+
+        return "PURCHASE_QTY"
+
+
+    context.user_data[
+        "current_qty"
+    ] = quantity
+
+
+    product = db.get_product(
+        context.user_data[
+            "current_product"
+        ]
+    )
+
+
+    await update.message.reply_text(
+        "💰 قیمت خرید واحد را وارد کنید:\n\n"
+        f"قیمت خرید فعلی: "
+        f"{money(product['purchase_cost'])}"
+    )
+
+    return "PURCHASE_PRICE"
+
+
+async def purchase_price(
+    update,
+    context,
+):
+
+    try:
+
+        price = parse_amount(
+            update.message.text
+        )
+
+        if price < 0:
+            raise ValueError
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ مبلغ نامعتبر است."
+        )
+
+        return "PURCHASE_PRICE"
+
+
+    product_id = context.user_data[
+        "current_product"
+    ]
+
+    quantity = context.user_data[
+        "current_qty"
+    ]
+
+
+    context.user_data[
+        "items"
+    ].append(
+        {
+            "product_id": product_id,
+            "qty": quantity,
+            "unit_price": price,
+            "discount": 0,
+            "tax": 0,
+            "line_total": int(
+                round(
+                    quantity * price
+                )
+            ),
+        }
+    )
+
+
+    context.user_data.pop(
+        "current_product",
+        None,
+    )
+
+    context.user_data.pop(
+        "current_qty",
+        None,
+    )
+
+
+    await update.message.reply_text(
+
+        "✅ قلم خرید اضافه شد.",
+
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ افزودن کالا",
+                        callback_data="purchase_more",
+                    ),
+
+                    InlineKeyboardButton(
+                        "➡️ ادامه",
+                        callback_data="purchase_continue",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+    return "PURCHASE_ITEMS"
+
+
+async def purchase_items_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+
+    if query.data == "purchase_more":
+
+        return await show_purchase_products(
+            query.message,
+            context,
+        )
+
+
+    await query.message.reply_text(
+        "روش پرداخت را انتخاب کنید:",
+        reply_markup=payment_keyboard(
+            "purchase"
+        ),
+    )
+
+    return "PURCHASE_PAYMENT"
+
+
+async def purchase_payment_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    method = (
+        query.data.split(":")[1]
+    )
+
+    context.user_data[
+        "payment"
+    ] = method
+
+
+    total = sum(
+        item["line_total"]
+        for item in context.user_data[
+            "items"
+        ]
+    )
+
+
+    await query.message.reply_text(
+
+        "🧾 پیش‌نمایش خرید\n\n"
+
+        f"تعداد اقلام: "
+        f"{len(context.user_data['items'])}\n"
+
+        f"جمع خرید: "
+        f"{money(total)}\n\n"
+
+        "آیا ثبت نهایی شود؟",
+
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ ثبت خرید",
+                        callback_data="purchase_confirm",
+                    ),
+
+                    InlineKeyboardButton(
+                        "❌ لغو",
+                        callback_data="cancel_flow",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+    return "PURCHASE_CONFIRM"
+
+
+async def purchase_confirm_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+
+    try:
+
+        (
+            invoice_id,
+            invoice_no,
+            total,
+            cost,
+        ) = PurchaseService.create_purchase(
+            supplier_id=context.user_data[
+                "party_id"
+            ],
+
+            items=context.user_data[
+                "items"
+            ],
+
+            payment_method=context.user_data[
+                "payment"
+            ],
+        )
+
+
+        reset_user_data(
+            context
+        )
+
+
+        await query.message.reply_text(
+
+            "✅ خرید با موفقیت ثبت شد.\n\n"
+
+            f"شماره فاکتور: "
+            f"{invoice_no}\n"
+
+            f"جمع خرید: "
+            f"{money(total)}\n\n"
+
+            "موجودی کالا و سند حسابداری "
+            "نیز ثبت شد.",
+
+            reply_markup=main_keyboard(),
+        )
+
+
+    except Exception as error:
+
+        await query.message.reply_text(
+            f"❌ ثبت خرید انجام نشد:\n"
+            f"{error}",
+            reply_markup=main_keyboard(),
+        )
+
+
+    return ConversationHandler.END
 
 
 # =========================================================
@@ -1008,303 +1686,387 @@ async def reports_menu(
     update,
     context,
 ):
-    keyboard = [
+
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "📦 گزارش موجودی",
-                callback_data="report_stock",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⚠️ کالاهای کم‌موجودی",
-                callback_data="report_low_stock",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧾 آخرین خریدها",
-                callback_data="report_purchases",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🛒 آخرین فروش‌ها",
-                callback_data="report_sales",
-            )
-        ],
-    ]
+            [
+                InlineKeyboardButton(
+                    "📦 موجودی",
+                    callback_data="report_stock",
+                ),
+
+                InlineKeyboardButton(
+                    "⚠️ کم‌موجودی",
+                    callback_data="report_low",
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "🧾 فاکتورها",
+                    callback_data="report_invoices",
+                ),
+            ],
+        ]
+    )
+
 
     await update.message.reply_text(
-        "📊 گزارش‌ها\n\n"
-        "گزارش موردنظر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        dashboard_text(),
+        reply_markup=keyboard,
     )
 
 
-async def report_stock_callback(
+async def reports_callback(
     update,
     context,
 ):
+
     query = update.callback_query
+
     await query.answer()
 
-    products = get_stock_report()
 
-    text = "📦 گزارش موجودی\n\n"
+    if query.data == "report_stock":
 
-    for product in products[:50]:
-        text += (
-            f"• {product['name']}\n"
-            f"  موجودی: {product['stock']} {product['unit']}\n"
-            f"  حداقل: {product['min_stock']}\n\n"
-        )
-
-    await query.edit_message_text(text)
+        text = stock_text()
 
 
-async def report_low_stock_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
+    elif query.data == "report_low":
 
-    products = get_low_stock_products()
+        text = low_stock_text()
 
-    if not products:
-        text = (
-            "✅ در حال حاضر کالایی زیر حداقل موجودی نیست."
-        )
+
     else:
-        text = "⚠️ هشدار کمبود موجودی\n\n"
 
-        for product in products:
-            text += (
-                f"• {product['name']}\n"
-                f"موجودی: {product['stock']}\n"
-                f"حداقل: {product['min_stock']}\n\n"
-            )
-
-    await query.edit_message_text(text)
+        text = invoices_text()
 
 
-async def report_purchases_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    invoices = list_invoices(
-        invoice_type="purchase",
-        limit=15,
+    await query.message.reply_text(
+        text
     )
-
-    if not invoices:
-        text = "هنوز خریدی ثبت نشده است."
-    else:
-        text = "🧾 آخرین خریدها\n\n"
-
-        for invoice in invoices:
-            text += (
-                f"فاکتور #{invoice['id']}\n"
-                f"تأمین‌کننده: "
-                f"{invoice['supplier_name'] or '-'}\n"
-                f"مبلغ: {money(invoice['total'])} تومان\n\n"
-            )
-
-    await query.edit_message_text(text)
-
-
-async def report_sales_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    await query.answer()
-
-    invoices = list_invoices(
-        invoice_type="sale",
-        limit=15,
-    )
-
-    if not invoices:
-        text = "هنوز فروشی ثبت نشده است."
-    else:
-        text = "🛒 آخرین فروش‌ها\n\n"
-
-        for invoice in invoices:
-            text += (
-                f"فاکتور #{invoice['id']}\n"
-                f"مشتری: "
-                f"{invoice['customer_name'] or '-'}\n"
-                f"مبلغ: {money(invoice['total'])} تومان\n\n"
-            )
-
-    await query.edit_message_text(text)
 
 
 # =========================================================
-# INVOICES
+# SUBSCRIPTIONS
 # =========================================================
 
-async def invoices_menu(
+def subscription_keyboard():
+
+    buttons = []
+
+    for code, (
+        name,
+        days,
+        amount,
+    ) in PLANS.items():
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{name} — {money(amount)}",
+                    callback_data=(
+                        f"plan:{code}"
+                    ),
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        buttons
+    )
+
+
+async def subscription_menu(
     update,
     context,
 ):
-    invoices = list_invoices(limit=20)
-
-    if not invoices:
-        await update.message.reply_text(
-            "📋 هنوز فاکتوری ثبت نشده است."
-        )
-        return
-
-    text = "📋 آخرین فاکتورها\n\n"
-
-    for invoice in invoices:
-        if invoice["invoice_type"] == "purchase":
-            invoice_type = "خرید"
-            party = invoice["supplier_name"]
-        else:
-            invoice_type = "فروش"
-            party = invoice["customer_name"]
-
-        text += (
-            f"#{invoice['id']} | {invoice_type}\n"
-            f"طرف حساب: {party or '-'}\n"
-            f"مبلغ: {money(invoice['total'])} تومان\n\n"
-        )
-
-    await update.message.reply_text(text)
-
-
-# =========================================================
-# SUBSCRIPTION
-# =========================================================
-
-async def subscription_start(
-    update,
-    context,
-):
-    user = update.effective_user
-
-    db_user = get_telegram_user(
-        user.id
-    )
-
-    if not db_user:
-        upsert_telegram_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-
-        db_user = get_telegram_user(
-            user.id
-        )
-
-    price = SUBSCRIPTION_MONTHLY_PRICE
-
-    if price <= 0:
-        await update.message.reply_text(
-            "⚠️ مبلغ اشتراک در تنظیمات Render تعیین نشده است."
-        )
-        return
-
-    payment_id = create_subscription_payment(
-        telegram_user_id=db_user["id"],
-        plan_code="monthly",
-        plan_name="اشتراک ماهانه",
-        amount=price,
-    )
 
     await update.message.reply_text(
-        "💳 خرید اشتراک ماهانه\n\n"
-        f"مبلغ: {money(price)} تومان\n\n"
-        f"شماره کارت:\n{CARD_NUMBER}\n\n"
-        f"به نام:\n{CARD_HOLDER}\n\n"
-        f"کد پرداخت: #{payment_id}\n\n"
-        "پس از پرداخت، تصویر رسید را همین‌جا ارسال کنید."
+
+        "💳 خرید اشتراک حساب‌یار پرو\n\n"
+        "پلن موردنظر را انتخاب کنید:",
+
+        reply_markup=subscription_keyboard(),
     )
+
+    return "SUBSCRIPTION_PLAN"
+
+
+async def subscription_plan_callback(
+    update,
+    context,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    code = query.data.split(":")[1]
+
+    plan = PLANS.get(code)
+
+    if not plan:
+
+        await query.message.reply_text(
+            "❌ پلن نامعتبر است."
+        )
+
+        return ConversationHandler.END
+
+
+    name, days, amount = plan
+
+
+    payment_id = db.create_payment(
+        telegram_id=update.effective_user.id,
+        plan_code=code,
+        plan_name=name,
+        amount=amount,
+    )
+
 
     context.user_data[
         "subscription_payment_id"
     ] = payment_id
 
 
-async def subscription_receipt_photo(
+    card = (
+        CARD_NUMBER
+        if CARD_NUMBER
+        else "در تنظیمات ربات ثبت نشده"
+    )
+
+
+    await query.message.reply_text(
+
+        f"💳 {name}\n\n"
+
+        f"مبلغ: {money(amount)}\n\n"
+
+        f"شماره کارت:\n"
+        f"{card}\n\n"
+
+        "پس از پرداخت، تصویر رسید را "
+        "همینجا ارسال کنید.",
+
+    )
+
+    return "SUBSCRIPTION_RECEIPT"
+
+
+async def subscription_receipt(
     update,
     context,
 ):
+
+    if not update.message.photo:
+
+        await update.message.reply_text(
+            "❌ لطفاً تصویر رسید پرداخت "
+            "را ارسال کنید."
+        )
+
+        return "SUBSCRIPTION_RECEIPT"
+
+
     payment_id = context.user_data.get(
         "subscription_payment_id"
     )
 
     if not payment_id:
-        return
 
-    if not update.message.photo:
-        return
+        await update.message.reply_text(
+            "❌ تراکنش پیدا نشد."
+        )
 
-    photo = update.message.photo[-1]
+        return ConversationHandler.END
 
-    attach_receipt_to_payment(
-        payment_id=payment_id,
-        receipt_file_id=photo.file_id,
-        receipt_file_unique_id=photo.file_unique_id,
+
+    photo = (
+        update.message.photo[-1]
     )
 
-    payment = get_payment(
+
+    db.attach_receipt(
+        payment_id=payment_id,
+        file_id=photo.file_id,
+        unique_id=photo.file_unique_id,
+    )
+
+
+    payment = db.get_payment(
         payment_id
     )
 
-    await update.message.reply_text(
-        "✅ رسید شما ثبت شد.\n\n"
-        "پس از بررسی مدیر، اشتراک فعال خواهد شد."
+
+    reset_user_data(
+        context
     )
 
-    keyboard = InlineKeyboardMarkup(
-        [
+
+    await update.message.reply_text(
+
+        "✅ رسید پرداخت دریافت شد.\n\n"
+
+        f"کد پیگیری: {payment_id}\n\n"
+
+        "پس از بررسی مدیریت، "
+        "اشتراک فعال خواهد شد.",
+
+        reply_markup=main_keyboard(),
+    )
+
+
+    if ADMIN_ID:
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ تأیید پرداخت",
+                        callback_data=(
+                            f"payment_approve:"
+                            f"{payment_id}"
+                        ),
+                    ),
+
+                    InlineKeyboardButton(
+                        "❌ رد پرداخت",
+                        callback_data=(
+                            f"payment_reject:"
+                            f"{payment_id}"
+                        ),
+                    ),
+                ]
+            ]
+        )
+
+
+        await context.bot.send_message(
+
+            chat_id=ADMIN_ID,
+
+            text=(
+                "🔔 رسید جدید اشتراک\n\n"
+
+                f"Payment ID: "
+                f"{payment_id}\n"
+
+                f"کاربر: "
+                f"{payment['telegram_id']}\n"
+
+                f"پلن: "
+                f"{payment['plan_name']}\n"
+
+                f"مبلغ: "
+                f"{money(payment['amount'])}"
+            ),
+
+            reply_markup=keyboard,
+        )
+
+
+        try:
+
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=photo.file_id,
+                caption=(
+                    f"🧾 رسید پرداخت #{payment_id}"
+                ),
+            )
+
+        except Exception:
+            pass
+
+
+    return ConversationHandler.END
+
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+async def admin_menu(
+    update,
+    context,
+):
+
+    if update.effective_user.id != ADMIN_ID:
+
+        await update.message.reply_text(
+            "⛔ دسترسی غیرمجاز."
+        )
+
+        return
+
+
+    payments = db.pending_payments()
+
+
+    if not payments:
+
+        text = (
+            "⚙️ پنل مدیریت\n\n"
+            "✅ پرداخت در انتظار بررسی وجود ندارد."
+        )
+
+        await update.message.reply_text(
+            text
+        )
+
+        return
+
+
+    lines = [
+        "⚙️ پرداخت‌های در انتظار بررسی",
+        "",
+    ]
+
+
+    buttons = []
+
+
+    for payment in payments:
+
+        lines.append(
+            f"#{payment['id']} | "
+            f"{payment['plan_name']} | "
+            f"{money(payment['amount'])}\n"
+            f"کاربر: "
+            f"{payment['telegram_id']}"
+        )
+
+
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    "✅ تأیید پرداخت",
-                    callback_data=f"pay_approve:{payment_id}",
+                    f"✅ تأیید #{payment['id']}",
+                    callback_data=(
+                        f"payment_approve:"
+                        f"{payment['id']}"
+                    ),
                 ),
+
                 InlineKeyboardButton(
-                    "❌ رد پرداخت",
-                    callback_data=f"pay_reject:{payment_id}",
+                    f"❌ رد #{payment['id']}",
+                    callback_data=(
+                        f"payment_reject:"
+                        f"{payment['id']}"
+                    ),
                 ),
             ]
-        ]
-    )
+        )
 
-    admin_text = (
-        "💳 درخواست پرداخت جدید\n\n"
-        f"کد پرداخت: #{payment_id}\n"
-        f"کاربر: {payment['first_name'] or '-'}\n"
-        f"Username: @{payment['username'] or '-'}\n"
-        f"Telegram ID: {payment['telegram_id']}\n"
-        f"مبلغ: {money(payment['amount'])} تومان"
-    )
 
-    await context.bot.send_message(
-        chat_id=ADMIN_TELEGRAM_ID,
-        text=admin_text,
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text(
 
-    await context.bot.send_photo(
-        chat_id=ADMIN_TELEGRAM_ID,
-        photo=photo.file_id,
-        caption=f"رسید پرداخت #{payment_id}",
-    )
+        "\n".join(lines),
 
-    context.user_data.pop(
-        "subscription_payment_id",
-        None,
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
     )
 
 
@@ -1312,486 +2074,631 @@ async def admin_payment_callback(
     update,
     context,
 ):
-    query = update.callback_query
 
-    if not is_admin(update):
-        await query.answer(
-            "دسترسی غیرمجاز",
-            show_alert=True,
-        )
-        return
+    query = update.callback_query
 
     await query.answer()
 
-    action, payment_id_text = query.data.split(
-        ":",
-        1,
+
+    if (
+        update.effective_user.id
+        != ADMIN_ID
+    ):
+
+        await query.message.reply_text(
+            "⛔ دسترسی غیرمجاز."
+        )
+
+        return
+
+
+    action, payment_id_text = (
+        query.data.split(":")
     )
 
-    payment_id = int(payment_id_text)
+    payment_id = int(
+        payment_id_text
+    )
 
-    payment = get_payment(
+
+    payment = db.get_payment(
         payment_id
     )
 
+
     if not payment:
-        await query.edit_message_text(
+
+        await query.message.reply_text(
             "❌ پرداخت پیدا نشد."
         )
+
         return
 
-    if action == "pay_approve":
 
-        start_date = date.today()
+    if action == "payment_approve":
 
-        end_date = (
-            start_date
-            + timedelta(
-                days=SUBSCRIPTION_MONTHLY_DAYS - 1
+        plan = PLANS.get(
+            payment["plan_code"]
+        )
+
+        if not plan:
+
+            await query.message.reply_text(
+                "❌ پلن اشتراک پیدا نشد."
             )
-        )
 
-        subscription = approve_subscription_payment(
-            payment_id=payment_id,
-            reviewed_by=ADMIN_TELEGRAM_ID,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
-        await query.edit_message_text(
-            "✅ پرداخت تأیید شد.\n\n"
-            f"کد پرداخت: #{payment_id}\n"
-            f"اشتراک: {payment['plan_name']}\n"
-            f"شروع: {subscription['start_date']}\n"
-            f"پایان: {subscription['end_date']}"
-        )
-
-        await context.bot.send_message(
-            chat_id=payment["telegram_id"],
-            text=(
-                "🎉 پرداخت شما تأیید شد.\n\n"
-                "اشتراک شما فعال شد.\n"
-                f"از {subscription['start_date']}\n"
-                f"تا {subscription['end_date']}"
-            ),
-        )
-
-    elif action == "pay_reject":
-
-        reject_subscription_payment(
-            payment_id=payment_id,
-            reviewed_by=ADMIN_TELEGRAM_ID,
-            reason="توسط مدیر رد شد",
-        )
-
-        await query.edit_message_text(
-            "❌ پرداخت رد شد.\n\n"
-            f"کد پرداخت: #{payment_id}"
-        )
-
-        await context.bot.send_message(
-            chat_id=payment["telegram_id"],
-            text=(
-                "❌ رسید پرداخت شما تأیید نشد.\n\n"
-                "لطفاً اطلاعات پرداخت را بررسی کرده "
-                "و رسید صحیح را ارسال کنید."
-            ),
-        )
-
-
-async def subscription_status(
-    update,
-    context,
-):
-    status = get_subscription_status(
-        update.effective_user.id
-    )
-
-    if not status["active"]:
-        await update.message.reply_text(
-            "⚪ شما در حال حاضر اشتراک فعال ندارید.",
-            reply_markup=main_menu(update),
-        )
-        return
-
-    sub = status["subscription"]
-
-    await update.message.reply_text(
-        "⚙️ وضعیت اشتراک\n\n"
-        f"طرح: {sub['plan_name']}\n"
-        f"شروع: {sub['start_date']}\n"
-        f"پایان: {sub['end_date']}\n"
-        f"روزهای باقی‌مانده: {status['remaining_days']}",
-        reply_markup=main_menu(update),
-    )
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-async def admin_panel(
-    update,
-    context,
-):
-    if not is_admin(update):
-        await update.message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
-        return
-
-    pending = get_pending_payments()
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "💳 پرداخت‌های در انتظار",
-                callback_data="admin_payments",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 تعداد کاربران",
-                callback_data="admin_users",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📦 موجودی",
-                callback_data="admin_stock",
-            )
-        ],
-    ]
-
-    await update.message.reply_text(
-        "⚙️ پنل مدیریت\n\n"
-        f"پرداخت‌های در انتظار: {len(pending)}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def admin_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-
-    if not is_admin(update):
-        await query.answer(
-            "دسترسی غیرمجاز",
-            show_alert=True,
-        )
-        return
-
-    await query.answer()
-
-    if query.data == "admin_payments":
-
-        payments = get_pending_payments()
-
-        if not payments:
-            await query.edit_message_text(
-                "✅ پرداخت در انتظاری وجود ندارد."
-            )
             return
 
-        text = "💳 پرداخت‌های در انتظار\n\n"
 
-        for payment in payments[:30]:
-            text += (
-                f"#{payment['id']} | "
-                f"{payment['first_name'] or '-'} | "
-                f"{money(payment['amount'])} تومان\n"
-            )
+        name, days, amount = plan
 
-        await query.edit_message_text(text)
 
-    elif query.data == "admin_users":
-
-        from app.db import get_connection
-
-        conn = get_connection()
-
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM telegram_users"
-        ).fetchone()
-
-        conn.close()
-
-        await query.edit_message_text(
-            f"👥 تعداد کاربران ثبت‌شده: {row['count']}"
+        result = db.approve_payment(
+            payment_id=payment_id,
+            reviewer_id=ADMIN_ID,
+            duration_days=days,
         )
 
-    elif query.data == "admin_stock":
 
-        products = get_stock_report()
+        if not result:
 
-        text = "📦 وضعیت موجودی\n\n"
-
-        for product in products[:30]:
-            text += (
-                f"{product['name']}: "
-                f"{product['stock']}\n"
+            await query.message.reply_text(
+                "⚠️ این پرداخت قبلاً بررسی شده است."
             )
 
-        await query.edit_message_text(text)
+            return
+
+
+        await query.message.reply_text(
+
+            "✅ پرداخت تأیید شد.\n\n"
+
+            f"پلن: "
+            f"{result['plan_name']}\n"
+
+            f"شروع: "
+            f"{result['start_date']}\n"
+
+            f"پایان: "
+            f"{result['end_date']}"
+        )
+
+
+        try:
+
+            await context.bot.send_message(
+
+                chat_id=payment[
+                    "telegram_id"
+                ],
+
+                text=(
+
+                    "🎉 پرداخت شما تأیید شد.\n\n"
+
+                    f"اشتراک: "
+                    f"{result['plan_name']}\n"
+
+                    f"شروع: "
+                    f"{result['start_date']}\n"
+
+                    f"پایان: "
+                    f"{result['end_date']}\n\n"
+
+                    "اشتراک شما با موفقیت فعال شد."
+                ),
+            )
+
+        except Exception:
+            pass
+
+
+    elif action == "payment_reject":
+
+        result = db.reject_payment(
+            payment_id=payment_id,
+            reviewer_id=ADMIN_ID,
+            reason="رد توسط مدیریت",
+        )
+
+
+        if not result:
+
+            await query.message.reply_text(
+                "⚠️ این پرداخت قبلاً بررسی شده است."
+            )
+
+            return
+
+
+        await query.message.reply_text(
+            "❌ پرداخت رد شد."
+        )
+
+
+        try:
+
+            await context.bot.send_message(
+
+                chat_id=payment[
+                    "telegram_id"
+                ],
+
+                text=(
+                    "❌ رسید پرداخت شما تأیید نشد.\n\n"
+                    "لطفاً با پشتیبانی تماس بگیرید."
+                ),
+            )
+
+        except Exception:
+            pass
 
 
 # =========================================================
-# SUPPORT
+# PAYMENT KEYBOARD
 # =========================================================
 
-async def support(
+def payment_keyboard(
+    prefix,
+):
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💵 نقدی",
+                    callback_data=(
+                        f"{prefix}:cash"
+                    ),
+                ),
+
+                InlineKeyboardButton(
+                    "🏦 کارت / بانک",
+                    callback_data=(
+                        f"{prefix}:bank"
+                    ),
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "📒 نسیه / اعتباری",
+                    callback_data=(
+                        f"{prefix}:credit"
+                    ),
+                ),
+            ],
+        ]
+    )
+
+
+# =========================================================
+# CANCEL
+# =========================================================
+
+async def cancel_flow(
     update,
     context,
 ):
-    await update.message.reply_text(
-        "👨‍💼 پشتیبانی حساب‌یار پرو\n\n"
-        "برای ارتباط با پشتیبانی، پیام خود را "
-        "در همین چت ارسال کنید.\n\n"
-        "در نسخه بعدی، سیستم تیکت پشتیبانی نیز اضافه می‌شود.",
-        reply_markup=main_menu(update),
+
+    reset_user_data(
+        context
     )
 
+    query = update.callback_query
+
+    if query:
+
+        await query.answer()
+
+        await query.message.reply_text(
+            "❌ عملیات لغو شد.",
+            reply_markup=main_keyboard(),
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ عملیات لغو شد.",
+            reply_markup=main_keyboard(),
+        )
+
+    return ConversationHandler.END
+
 
 # =========================================================
-# SALES - پایه فعال
+# UNKNOWN
 # =========================================================
 
-async def sale_start(
+async def unknown(
     update,
     context,
 ):
-    customers = list_customers()
-
-    if not customers:
-        await update.message.reply_text(
-            "برای ثبت فروش ابتدا حداقل یک مشتری ثبت کنید."
-        )
-        return
-
-    products = list_products()
-
-    if not products:
-        await update.message.reply_text(
-            "برای ثبت فروش ابتدا حداقل یک کالا ثبت کنید."
-        )
-        return
 
     await update.message.reply_text(
-        "🛒 ماژول ثبت فروش\n\n"
-        "موتور فروش آماده است؛ "
-        "در این نسخه، تکمیل گردش ثبت فروش "
-        "در مرحله بعدی انجام می‌شود."
+        "❓ گزینه نامعتبر است.\n"
+        "برای شروع دوباره /start را ارسال کنید.",
+        reply_markup=main_keyboard(),
     )
 
 
 # =========================================================
-# REGISTER
+# APPLICATION
 # =========================================================
 
-def register_handlers(application):
+def build_application(
+    token,
+):
 
-    purchase_conversation = ConversationHandler(
-        entry_points=[
-            MessageHandler(
-                filters.Regex("^🧾 ثبت خرید$"),
-                purchase_start,
-            )
-        ],
-        states={
-            PURCHASE_SUPPLIER: [
-                CallbackQueryHandler(
-                    purchase_supplier_callback,
-                    pattern=r"^pur_(supplier|cancel)",
-                )
-            ],
-
-            PURCHASE_PRODUCT: [
-                CallbackQueryHandler(
-                    purchase_add_item_callback,
-                    pattern=r"^pur_add_item$",
-                ),
-                CallbackQueryHandler(
-                    purchase_continue_callback,
-                    pattern=r"^pur_continue$",
-                ),
-                CallbackQueryHandler(
-                    purchase_product_callback,
-                    pattern=r"^pur_product:",
-                ),
-                CallbackQueryHandler(
-                    purchase_product_callback,
-                    pattern=r"^pur_cancel$",
-                ),
-            ],
-
-            PURCHASE_QUANTITY: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    purchase_quantity,
-                )
-            ],
-
-            PURCHASE_PRICE: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    purchase_price,
-                )
-            ],
-
-            PURCHASE_DISCOUNT: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    purchase_discount,
-                )
-            ],
-
-            PURCHASE_PAYMENT: [
-                CallbackQueryHandler(
-                    purchase_payment_callback,
-                    pattern=r"^pur_(pay|cancel)",
-                )
-            ],
-
-            PURCHASE_CONFIRM: [
-                CallbackQueryHandler(
-                    purchase_confirm_callback,
-                    pattern=r"^pur_(confirm|cancel)$",
-                )
-            ],
-        },
-
-        fallbacks=[
-            CommandHandler(
-                "cancel",
-                purchase_cancel,
-            )
-        ],
-
-        allow_reentry=True,
+    application = (
+        Application
+        .builder()
+        .token(token)
+        .concurrent_updates(False)
+        .build()
     )
+
+
+    # -----------------------------------------------------
+    # START
+    # -----------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # MASTER DATA
+    # -----------------------------------------------------
+
+    master_conversation = (
+        ConversationHandler(
+
+            entry_points=[
+                CallbackQueryHandler(
+                    master_callback,
+                    pattern=(
+                        r"^(new_customer|"
+                        r"new_supplier|"
+                        r"new_product)$"
+                    ),
+                )
+            ],
+
+            states={
+                "MASTER": [
+                    MessageHandler(
+                        filters.TEXT
+                        & ~filters.COMMAND,
+                        master_text,
+                    )
+                ]
+            },
+
+            fallbacks=[
+                CommandHandler(
+                    "cancel",
+                    cancel_flow,
+                )
+            ],
+
+            allow_reentry=True,
+        )
+    )
+
+
+    application.add_handler(
+        master_conversation
+    )
+
+
+    # -----------------------------------------------------
+    # SALES
+    # -----------------------------------------------------
+
+    sales_conversation = (
+        ConversationHandler(
+
+            entry_points=[
+                MessageHandler(
+                    filters.Regex(
+                        r"^🛒 ثبت فروش$"
+                    ),
+                    sales_start,
+                )
+            ],
+
+            states={
+
+                "SALE_CUSTOMER": [
+                    CallbackQueryHandler(
+                        sale_customer_callback,
+                        pattern=r"^sale_customer:",
+                    )
+                ],
+
+                "SALE_PRODUCT": [
+                    CallbackQueryHandler(
+                        sale_product_callback,
+                        pattern=r"^sale_product:",
+                    )
+                ],
+
+                "SALE_QTY": [
+                    MessageHandler(
+                        filters.TEXT
+                        & ~filters.COMMAND,
+                        sale_qty,
+                    )
+                ],
+
+                "SALE_PRICE": [
+                    MessageHandler(
+                        filters.TEXT
+                        & ~filters.COMMAND,
+                        sale_price,
+                    )
+                ],
+
+                "SALE_ITEMS": [
+                    CallbackQueryHandler(
+                        sale_items_callback,
+                        pattern=(
+                            r"^(sale_more|"
+                            r"sale_continue)$"
+                        ),
+                    )
+                ],
+
+                "SALE_PAYMENT": [
+                    CallbackQueryHandler(
+                        sale_payment_callback,
+                        pattern=r"^sale:",
+                    )
+                ],
+
+                "SALE_CONFIRM": [
+                    CallbackQueryHandler(
+                        sale_confirm_callback,
+                        pattern=r"^sale_confirm$",
+                    ),
+
+                    CallbackQueryHandler(
+                        cancel_flow,
+                        pattern=r"^cancel_flow$",
+                    ),
+                ],
+            },
+
+            fallbacks=[
+                CallbackQueryHandler(
+                    cancel_flow,
+                    pattern=r"^cancel_flow$",
+                )
+            ],
+
+            allow_reentry=True,
+        )
+    )
+
+
+    application.add_handler(
+        sales_conversation
+    )
+
+
+    # -----------------------------------------------------
+    # PURCHASES
+    # -----------------------------------------------------
+
+    purchase_conversation = (
+        ConversationHandler(
+
+            entry_points=[
+                MessageHandler(
+                    filters.Regex(
+                        r"^🧾 ثبت خرید$"
+                    ),
+                    purchase_start,
+                )
+            ],
+
+            states={
+
+                "PURCHASE_SUPPLIER": [
+                    CallbackQueryHandler(
+                        purchase_supplier_callback,
+                        pattern=(
+                            r"^purchase_supplier:"
+                        ),
+                    )
+                ],
+
+                "PURCHASE_PRODUCT": [
+                    CallbackQueryHandler(
+                        purchase_product_callback,
+                        pattern=(
+                            r"^purchase_product:"
+                        ),
+                    )
+                ],
+
+                "PURCHASE_QTY": [
+                    MessageHandler(
+                        filters.TEXT
+                        & ~filters.COMMAND,
+                        purchase_qty,
+                    )
+                ],
+
+                "PURCHASE_PRICE": [
+                    MessageHandler(
+                        filters.TEXT
+                        & ~filters.COMMAND,
+                        purchase_price,
+                    )
+                ],
+
+                "PURCHASE_ITEMS": [
+                    CallbackQueryHandler(
+                        purchase_items_callback,
+                        pattern=(
+                            r"^(purchase_more|"
+                            r"purchase_continue)$"
+                        ),
+                    )
+                ],
+
+                "PURCHASE_PAYMENT": [
+                    CallbackQueryHandler(
+                        purchase_payment_callback,
+                        pattern=r"^purchase:",
+                    )
+                ],
+
+                "PURCHASE_CONFIRM": [
+                    CallbackQueryHandler(
+                        purchase_confirm_callback,
+                        pattern=(
+                            r"^purchase_confirm$"
+                        ),
+                    ),
+
+                    CallbackQueryHandler(
+                        cancel_flow,
+                        pattern=r"^cancel_flow$",
+                    ),
+                ],
+            },
+
+            fallbacks=[
+                CallbackQueryHandler(
+                    cancel_flow,
+                    pattern=r"^cancel_flow$",
+                )
+            ],
+
+            allow_reentry=True,
+        )
+    )
+
 
     application.add_handler(
         purchase_conversation
     )
 
-    # Start
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
+
+    # -----------------------------------------------------
+    # SUBSCRIPTION
+    # -----------------------------------------------------
+
+    subscription_conversation = (
+        ConversationHandler(
+
+            entry_points=[
+                MessageHandler(
+                    filters.Regex(
+                        r"^💳 خرید اشتراک$"
+                    ),
+                    subscription_menu,
+                ),
+
+                CallbackQueryHandler(
+                    subscription_plan_callback,
+                    pattern=r"^plan:",
+                ),
+            ],
+
+            states={
+
+                "SUBSCRIPTION_PLAN": [
+                    CallbackQueryHandler(
+                        subscription_plan_callback,
+                        pattern=r"^plan:",
+                    )
+                ],
+
+                "SUBSCRIPTION_RECEIPT": [
+                    MessageHandler(
+                        filters.PHOTO,
+                        subscription_receipt,
+                    )
+                ],
+            },
+
+            fallbacks=[
+                CallbackQueryHandler(
+                    cancel_flow,
+                    pattern=r"^cancel_flow$",
+                )
+            ],
+
+            allow_reentry=True,
         )
     )
 
-    # Subscription
+
+    application.add_handler(
+        subscription_conversation
+    )
+
+
+    # -----------------------------------------------------
+    # REPORTS
+    # -----------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            reports_callback,
+            pattern=(
+                r"^report_(stock|low|invoices)$"
+            ),
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # ADMIN PAYMENTS
+    # -----------------------------------------------------
+
     application.add_handler(
         CallbackQueryHandler(
             admin_payment_callback,
-            pattern=r"^pay_(approve|reject):",
+            pattern=(
+                r"^payment_"
+                r"(approve|reject):"
+            ),
         )
     )
+
+
+    # -----------------------------------------------------
+    # GENERAL MENU
+    # -----------------------------------------------------
 
     application.add_handler(
         MessageHandler(
-            filters.PHOTO,
-            subscription_receipt_photo,
+            filters.TEXT
+            & ~filters.COMMAND,
+            main_menu,
         )
     )
 
-    # Customer/Product/Supplier callbacks
-    application.add_handler(
-        CallbackQueryHandler(
-            customer_add_callback,
-            pattern=r"^customer_add$",
-        )
-    )
 
-    application.add_handler(
-        CallbackQueryHandler(
-            product_add_callback,
-            pattern=r"^product_add$",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            supplier_add_callback,
-            pattern=r"^supplier_add$",
-        )
-    )
-
-    # Reports
-    application.add_handler(
-        CallbackQueryHandler(
-            report_stock_callback,
-            pattern=r"^report_stock$",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            report_low_stock_callback,
-            pattern=r"^report_low_stock$",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            report_purchases_callback,
-            pattern=r"^report_purchases$",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            report_sales_callback,
-            pattern=r"^report_sales$",
-        )
-    )
-
-    # Admin
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_callback,
-            pattern=r"^admin_(payments|users|stock)$",
-        )
-    )
-
-    # Text menu
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            menu_text,
-        )
-    )
-
-    # Dynamic master-data text handlers
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            customer_add_text,
-        ),
-        group=1,
-    )
+    # -----------------------------------------------------
+    # UNKNOWN
+    # -----------------------------------------------------
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            product_add_text,
-        ),
-        group=2,
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            supplier_add_text,
-        ),
-        group=3,
+            filters.ALL,
+            unknown,
+        )
     )
 
 
-def build_application(application):
-    register_handlers(application)
     return application
