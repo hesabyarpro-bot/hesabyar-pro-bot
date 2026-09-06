@@ -1,980 +1,1393 @@
 import os
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, date
 
-DB_PATH = os.getenv("DB_PATH", "hesabyar.db")
+from datetime import datetime, date, timedelta
+from contextlib import contextmanager
+
+
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "hesabyar.db",
+)
+
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+
+CREATE TABLE IF NOT EXISTS telegram_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER UNIQUE NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    is_active INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT,
+    national_id TEXT,
+    address TEXT,
+    created_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT,
+    national_id TEXT,
+    address TEXT,
+    created_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    unit TEXT DEFAULT 'عدد',
+    sale_price INTEGER NOT NULL DEFAULT 0,
+    purchase_cost INTEGER NOT NULL DEFAULT 0,
+    stock REAL NOT NULL DEFAULT 0,
+    min_stock REAL NOT NULL DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_no INTEGER UNIQUE NOT NULL,
+    invoice_type TEXT NOT NULL,
+    customer_id INTEGER,
+    supplier_id INTEGER,
+    subtotal INTEGER NOT NULL DEFAULT 0,
+    discount INTEGER NOT NULL DEFAULT 0,
+    tax INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    payment_method TEXT,
+    status TEXT DEFAULT 'confirmed',
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY(customer_id)
+        REFERENCES customers(id),
+
+    FOREIGN KEY(supplier_id)
+        REFERENCES suppliers(id)
+);
+
+
+CREATE TABLE IF NOT EXISTS invoice_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    qty REAL NOT NULL,
+    unit_price INTEGER NOT NULL,
+    discount INTEGER DEFAULT 0,
+    tax INTEGER DEFAULT 0,
+    line_total INTEGER NOT NULL,
+    cost_total INTEGER DEFAULT 0,
+
+    FOREIGN KEY(invoice_id)
+        REFERENCES invoices(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(product_id)
+        REFERENCES products(id)
+);
+
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    movement_type TEXT NOT NULL,
+    qty REAL NOT NULL,
+    unit_cost INTEGER DEFAULT 0,
+    ref_type TEXT,
+    ref_id INTEGER,
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY(product_id)
+        REFERENCES products(id)
+);
+
+
+CREATE TABLE IF NOT EXISTS journal_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_type TEXT,
+    ref_id INTEGER,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS journal_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    journal_id INTEGER NOT NULL,
+    account_code TEXT NOT NULL,
+    debit INTEGER DEFAULT 0,
+    credit INTEGER DEFAULT 0,
+
+    FOREIGN KEY(journal_id)
+        REFERENCES journal_entries(id)
+        ON DELETE CASCADE
+);
+
+
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    payment_method TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS subscription_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER NOT NULL,
+    plan_code TEXT NOT NULL,
+    plan_name TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    receipt_file_id TEXT,
+    receipt_file_unique_id TEXT,
+    status TEXT DEFAULT 'pending',
+    submitted_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by INTEGER,
+    rejection_reason TEXT,
+
+    FOREIGN KEY(telegram_user_id)
+        REFERENCES telegram_users(id)
+);
+
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER NOT NULL,
+    plan_code TEXT NOT NULL,
+    plan_name TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    payment_id INTEGER,
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY(telegram_user_id)
+        REFERENCES telegram_users(id),
+
+    FOREIGN KEY(payment_id)
+        REFERENCES subscription_payments(id)
+);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_invoice_items_invoice
+ON invoice_items(invoice_id);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_stock_product
+ON stock_movements(product_id);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_payments_status
+ON subscription_payments(status);
+"""
+
+
+def now():
+    return datetime.now().isoformat(
+        timespec="seconds"
+    )
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+    connection = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+    )
 
+    connection.row_factory = sqlite3.Row
 
-get_conn = get_connection
+    connection.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
+    return connection
 
 
 @contextmanager
 def db_transaction():
-    conn = get_connection()
+    connection = get_connection()
+
     try:
-        yield conn
-        conn.commit()
+        yield connection
+        connection.commit()
+
     except Exception:
-        conn.rollback()
+        connection.rollback()
         raise
+
     finally:
-        conn.close()
-
-
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def table_columns(conn, table_name):
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
-
-
-def add_column_if_missing(conn, table_name, column_name, definition):
-    columns = table_columns(conn, table_name)
-    if column_name not in columns:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
-        )
+        connection.close()
 
 
 def init_db():
-    conn = get_connection()
+    with get_connection() as connection:
 
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS telegram_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE NOT NULL,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT,
-            updated_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT,
-            address TEXT,
-            active INTEGER DEFAULT 1,
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS suppliers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT,
-            address TEXT,
-            active INTEGER DEFAULT 1,
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            code TEXT,
-            unit TEXT DEFAULT 'عدد',
-            purchase_cost REAL DEFAULT 0,
-            sale_price REAL DEFAULT 0,
-            stock REAL DEFAULT 0,
-            min_stock REAL DEFAULT 0,
-            active INTEGER DEFAULT 1,
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS invoices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_type TEXT NOT NULL,
-            customer_id INTEGER,
-            supplier_id INTEGER,
-            invoice_date TEXT,
-            subtotal REAL DEFAULT 0,
-            discount REAL DEFAULT 0,
-            tax REAL DEFAULT 0,
-            total REAL DEFAULT 0,
-            payment_method TEXT,
-            notes TEXT,
-            created_at TEXT,
-            FOREIGN KEY(customer_id) REFERENCES customers(id),
-            FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS invoice_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            quantity REAL NOT NULL,
-            unit_price REAL NOT NULL,
-            discount REAL DEFAULT 0,
-            tax REAL DEFAULT 0,
-            total REAL DEFAULT 0,
-            FOREIGN KEY(invoice_id) REFERENCES invoices(id),
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS stock_movements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            invoice_id INTEGER,
-            movement_type TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            unit_cost REAL DEFAULT 0,
-            movement_date TEXT,
-            notes TEXT,
-            FOREIGN KEY(product_id) REFERENCES products(id),
-            FOREIGN KEY(invoice_id) REFERENCES invoices(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS journal_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_date TEXT,
-            description TEXT,
-            reference_type TEXT,
-            reference_id INTEGER,
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS journal_lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            journal_entry_id INTEGER NOT NULL,
-            account_code TEXT NOT NULL,
-            account_name TEXT,
-            debit REAL DEFAULT 0,
-            credit REAL DEFAULT 0,
-            FOREIGN KEY(journal_entry_id) REFERENCES journal_entries(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS subscription_payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_user_id INTEGER NOT NULL,
-            plan_code TEXT NOT NULL,
-            plan_name TEXT NOT NULL,
-            amount REAL DEFAULT 0,
-            receipt_file_id TEXT,
-            receipt_file_unique_id TEXT,
-            status TEXT DEFAULT 'pending',
-            submitted_at TEXT,
-            reviewed_at TEXT,
-            reviewed_by INTEGER,
-            rejection_reason TEXT,
-            FOREIGN KEY(telegram_user_id) REFERENCES telegram_users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_user_id INTEGER NOT NULL,
-            plan_code TEXT NOT NULL,
-            plan_name TEXT NOT NULL,
-            start_date TEXT,
-            end_date TEXT,
-            status TEXT DEFAULT 'inactive',
-            payment_id INTEGER,
-            created_at TEXT,
-            updated_at TEXT,
-            FOREIGN KEY(telegram_user_id) REFERENCES telegram_users(id),
-            FOREIGN KEY(payment_id) REFERENCES subscription_payments(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_products_code
-        ON products(code);
-
-        CREATE INDEX IF NOT EXISTS idx_invoice_type
-        ON invoices(invoice_type);
-
-        CREATE INDEX IF NOT EXISTS idx_stock_product
-        ON stock_movements(product_id);
-
-        CREATE INDEX IF NOT EXISTS idx_subscription_user
-        ON subscriptions(telegram_user_id);
-
-        CREATE INDEX IF NOT EXISTS idx_payment_status
-        ON subscription_payments(status);
-        """
-    )
-
-    # Migration
-    add_column_if_missing(
-        conn, "customers", "active", "INTEGER DEFAULT 1"
-    )
-    add_column_if_missing(
-        conn, "customers", "created_at", "TEXT"
-    )
-
-    add_column_if_missing(
-        conn, "products", "active", "INTEGER DEFAULT 1"
-    )
-    add_column_if_missing(
-        conn, "products", "stock", "REAL DEFAULT 0"
-    )
-    add_column_if_missing(
-        conn, "products", "min_stock", "REAL DEFAULT 0"
-    )
-    add_column_if_missing(
-        conn, "products", "created_at", "TEXT"
-    )
-
-    add_column_if_missing(
-        conn, "suppliers", "active", "INTEGER DEFAULT 1"
-    )
-    add_column_if_missing(
-        conn, "suppliers", "created_at", "TEXT"
-    )
-
-    # Seed data
-    customer = conn.execute(
-        "SELECT id FROM customers LIMIT 1"
-    ).fetchone()
-
-    if not customer:
-        conn.execute(
-            """
-            INSERT INTO customers
-            (name, phone, address, active, created_at)
-            VALUES (?, ?, ?, 1, ?)
-            """,
-            ("مشتری نمونه", "09120000000", "", now()),
+        connection.executescript(
+            SCHEMA
         )
 
-    supplier = conn.execute(
-        "SELECT id FROM suppliers LIMIT 1"
-    ).fetchone()
+        customer_count = connection.execute(
+            "SELECT COUNT(*) FROM customers"
+        ).fetchone()[0]
 
-    if not supplier:
-        conn.execute(
+        if customer_count == 0:
+            connection.execute(
+                """
+                INSERT INTO customers
+                (
+                    name,
+                    phone,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "مشتری نمونه",
+                    "09120000000",
+                    now(),
+                ),
+            )
+
+        supplier_count = connection.execute(
+            "SELECT COUNT(*) FROM suppliers"
+        ).fetchone()[0]
+
+        if supplier_count == 0:
+            connection.execute(
+                """
+                INSERT INTO suppliers
+                (
+                    name,
+                    phone,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "تأمین‌کننده نمونه",
+                    "09120000001",
+                    now(),
+                ),
+            )
+
+        product_count = connection.execute(
+            "SELECT COUNT(*) FROM products"
+        ).fetchone()[0]
+
+        if product_count == 0:
+            connection.execute(
+                """
+                INSERT INTO products
+                (
+                    code,
+                    name,
+                    unit,
+                    sale_price,
+                    purchase_cost,
+                    stock,
+                    min_stock,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "1001",
+                    "کالای نمونه",
+                    "عدد",
+                    320000,
+                    250000,
+                    10,
+                    2,
+                    now(),
+                ),
+            )
+
+
+# =========================================================
+# TELEGRAM USERS
+# =========================================================
+
+def upsert_telegram_user(user):
+    timestamp = now()
+
+    with get_connection() as connection:
+
+        connection.execute(
             """
-            INSERT INTO suppliers
-            (name, phone, address, active, created_at)
-            VALUES (?, ?, ?, 1, ?)
-            """,
-            ("تأمین‌کننده نمونه", "09121111111", "", now()),
-        )
+            INSERT INTO telegram_users
+            (
+                telegram_id,
+                username,
+                first_name,
+                last_name,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
 
-    product = conn.execute(
-        "SELECT id FROM products LIMIT 1"
-    ).fetchone()
-
-    if not product:
-        conn.execute(
-            """
-            INSERT INTO products
-            (name, code, unit, purchase_cost, sale_price,
-             stock, min_stock, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(telegram_id)
+            DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                updated_at=excluded.updated_at
             """,
             (
-                "کالای نمونه",
-                "P001",
-                "عدد",
-                100000,
-                150000,
-                0,
-                5,
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM telegram_users
+            WHERE telegram_id=?
+            """,
+            (user.id,),
+        ).fetchone()
+
+
+def get_user(telegram_id):
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM telegram_users
+            WHERE telegram_id=?
+            """,
+            (telegram_id,),
+        ).fetchone()
+
+
+# =========================================================
+# CUSTOMERS
+# =========================================================
+
+def list_customers():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM customers
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+
+def add_customer(
+    name,
+    phone="",
+    national_id="",
+    address="",
+):
+    with get_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO customers
+            (
+                name,
+                phone,
+                national_id,
+                address,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                phone,
+                national_id,
+                address,
                 now(),
             ),
         )
 
-    conn.commit()
-    conn.close()
+        return cursor.lastrowid
 
 
-# -------------------------
-# Telegram Users
-# -------------------------
+# =========================================================
+# SUPPLIERS
+# =========================================================
 
-def upsert_telegram_user(
-    telegram_id,
-    username=None,
-    first_name=None,
-    last_name=None,
+def list_suppliers():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM suppliers
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+
+def add_supplier(
+    name,
+    phone="",
+    national_id="",
+    address="",
 ):
-    with db_transaction() as conn:
-        existing = conn.execute(
-            "SELECT id FROM telegram_users WHERE telegram_id=?",
-            (telegram_id,),
-        ).fetchone()
+    with get_connection() as connection:
 
-        if existing:
-            conn.execute(
-                """
-                UPDATE telegram_users
-                SET username=?,
-                    first_name=?,
-                    last_name=?,
-                    updated_at=?
-                WHERE telegram_id=?
-                """,
-                (
-                    username,
-                    first_name,
-                    last_name,
-                    now(),
-                    telegram_id,
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO telegram_users
-                (telegram_id, username, first_name, last_name,
-                 is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?)
-                """,
-                (
-                    telegram_id,
-                    username,
-                    first_name,
-                    last_name,
-                    now(),
-                    now(),
-                ),
-            )
-
-        return conn.execute(
-            "SELECT * FROM telegram_users WHERE telegram_id=?",
-            (telegram_id,),
-        ).fetchone()
-
-
-def get_telegram_user(telegram_id):
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM telegram_users WHERE telegram_id=?",
-        (telegram_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-# -------------------------
-# Customers
-# -------------------------
-
-def list_customers(active_only=True):
-    conn = get_connection()
-
-    if active_only:
-        rows = conn.execute(
-            """
-            SELECT * FROM customers
-            WHERE active=1
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM customers
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    conn.close()
-    return rows
-
-
-def get_customer(customer_id):
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM customers WHERE id=?",
-        (customer_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def create_customer(name, phone="", address=""):
-    with db_transaction() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO customers
-            (name, phone, address, active, created_at)
-            VALUES (?, ?, ?, 1, ?)
-            """,
-            (name, phone, address, now()),
-        )
-        return cur.lastrowid
-
-
-def deactivate_customer(customer_id):
-    with db_transaction() as conn:
-        conn.execute(
-            "UPDATE customers SET active=0 WHERE id=?",
-            (customer_id,),
-        )
-
-
-# -------------------------
-# Suppliers
-# -------------------------
-
-def list_suppliers(active_only=True):
-    conn = get_connection()
-
-    if active_only:
-        rows = conn.execute(
-            """
-            SELECT * FROM suppliers
-            WHERE active=1
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM suppliers
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    conn.close()
-    return rows
-
-
-def get_supplier(supplier_id):
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM suppliers WHERE id=?",
-        (supplier_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def create_supplier(name, phone="", address=""):
-    with db_transaction() as conn:
-        cur = conn.execute(
+        cursor = connection.execute(
             """
             INSERT INTO suppliers
-            (name, phone, address, active, created_at)
-            VALUES (?, ?, ?, 1, ?)
-            """,
-            (name, phone, address, now()),
-        )
-        return cur.lastrowid
-
-
-def deactivate_supplier(supplier_id):
-    with db_transaction() as conn:
-        conn.execute(
-            "UPDATE suppliers SET active=0 WHERE id=?",
-            (supplier_id,),
-        )
-
-
-# -------------------------
-# Products
-# -------------------------
-
-def list_products(active_only=True):
-    conn = get_connection()
-
-    if active_only:
-        rows = conn.execute(
-            """
-            SELECT * FROM products
-            WHERE active=1
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM products
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    conn.close()
-    return rows
-
-
-def get_product(product_id):
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM products WHERE id=?",
-        (product_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def create_product(
-    name,
-    code="",
-    unit="عدد",
-    purchase_cost=0,
-    sale_price=0,
-    min_stock=0,
-):
-    with db_transaction() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO products
-            (name, code, unit, purchase_cost, sale_price,
-             stock, min_stock, active, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)
+            (
+                name,
+                phone,
+                national_id,
+                address,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 name,
+                phone,
+                national_id,
+                address,
+                now(),
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+# =========================================================
+# PRODUCTS
+# =========================================================
+
+def list_products(
+    active_only=True,
+):
+    with get_connection() as connection:
+
+        if active_only:
+            query = """
+                SELECT *
+                FROM products
+                WHERE active=1
+                ORDER BY id DESC
+            """
+            return connection.execute(
+                query
+            ).fetchall()
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM products
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+
+def get_product(product_id):
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE id=?
+            """,
+            (product_id,),
+        ).fetchone()
+
+
+def add_product(
+    code,
+    name,
+    unit,
+    sale_price,
+    purchase_cost,
+    min_stock,
+):
+    with get_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO products
+            (
                 code,
+                name,
                 unit,
-                purchase_cost,
                 sale_price,
+                purchase_cost,
+                min_stock,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code,
+                name,
+                unit,
+                sale_price,
+                purchase_cost,
                 min_stock,
                 now(),
             ),
         )
-        return cur.lastrowid
+
+        return cursor.lastrowid
 
 
-def deactivate_product(product_id):
-    with db_transaction() as conn:
-        conn.execute(
-            "UPDATE products SET active=0 WHERE id=?",
-            (product_id,),
+# =========================================================
+# INVOICES
+# =========================================================
+
+def next_invoice_no(connection):
+    return connection.execute(
+        """
+        SELECT
+            COALESCE(MAX(invoice_no), 0) + 1
+        FROM invoices
+        """
+    ).fetchone()[0]
+
+
+def create_invoice(
+    invoice_type,
+    party_id,
+    items,
+    payment_method,
+    discount=0,
+    tax=0,
+):
+    from .accounting import (
+        sale_entry_lines,
+        purchase_entry_lines,
+    )
+
+    if not items:
+        raise ValueError(
+            "فاکتور بدون قلم قابل ثبت نیست."
         )
 
+    with get_connection() as connection:
 
-# -------------------------
-# Invoices / Reports
-# -------------------------
+        try:
+            connection.execute("BEGIN")
+
+            invoice_no = next_invoice_no(
+                connection
+            )
+
+            subtotal = sum(
+                int(item["line_total"])
+                for item in items
+            )
+
+            total = (
+                subtotal
+                - int(discount)
+                + int(tax)
+            )
+
+            if total < 0:
+                raise ValueError(
+                    "مبلغ نهایی نمی‌تواند منفی باشد."
+                )
+
+            field = (
+                "customer_id"
+                if invoice_type == "sale"
+                else "supplier_id"
+            )
+
+            cursor = connection.execute(
+                f"""
+                INSERT INTO invoices
+                (
+                    invoice_no,
+                    invoice_type,
+                    {field},
+                    subtotal,
+                    discount,
+                    tax,
+                    total,
+                    payment_method,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invoice_no,
+                    invoice_type,
+                    party_id,
+                    subtotal,
+                    discount,
+                    tax,
+                    total,
+                    payment_method,
+                    "confirmed",
+                    now(),
+                ),
+            )
+
+            invoice_id = cursor.lastrowid
+
+            total_cost = 0
+
+            for item in items:
+
+                product = connection.execute(
+                    """
+                    SELECT *
+                    FROM products
+                    WHERE id=?
+                    AND active=1
+                    """,
+                    (
+                        item["product_id"],
+                    ),
+                ).fetchone()
+
+                if not product:
+                    raise ValueError(
+                        "کالا یافت نشد."
+                    )
+
+                quantity = float(
+                    item["qty"]
+                )
+
+                if quantity <= 0:
+                    raise ValueError(
+                        "تعداد باید بیشتر از صفر باشد."
+                    )
+
+                line_total = int(
+                    round(
+                        quantity
+                        * int(item["unit_price"])
+                        - int(item.get("discount", 0))
+                        + int(item.get("tax", 0))
+                    )
+                )
+
+                if invoice_type == "sale":
+
+                    if product["stock"] < quantity:
+                        raise ValueError(
+                            f"موجودی کالای «{product['name']}» کافی نیست."
+                        )
+
+                    item_cost = int(
+                        round(
+                            quantity
+                            * product["purchase_cost"]
+                        )
+                    )
+
+                    total_cost += item_cost
+
+                    new_stock = (
+                        product["stock"]
+                        - quantity
+                    )
+
+                    movement_qty = -quantity
+                    movement_cost = (
+                        product["purchase_cost"]
+                    )
+
+                else:
+
+                    item_cost = 0
+
+                    new_stock = (
+                        product["stock"]
+                        + quantity
+                    )
+
+                    movement_qty = quantity
+                    movement_cost = int(
+                        item["unit_price"]
+                    )
+
+                    connection.execute(
+                        """
+                        UPDATE products
+                        SET purchase_cost=?
+                        WHERE id=?
+                        """,
+                        (
+                            item["unit_price"],
+                            product["id"],
+                        ),
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO invoice_items
+                    (
+                        invoice_id,
+                        product_id,
+                        qty,
+                        unit_price,
+                        discount,
+                        tax,
+                        line_total,
+                        cost_total
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        invoice_id,
+                        product["id"],
+                        quantity,
+                        item["unit_price"],
+                        item.get(
+                            "discount",
+                            0,
+                        ),
+                        item.get(
+                            "tax",
+                            0,
+                        ),
+                        line_total,
+                        item_cost,
+                    ),
+                )
+
+                connection.execute(
+                    """
+                    UPDATE products
+                    SET stock=?
+                    WHERE id=?
+                    """,
+                    (
+                        new_stock,
+                        product["id"],
+                    ),
+                )
+
+                connection.execute(
+                    """
+                    INSERT INTO stock_movements
+                    (
+                        product_id,
+                        movement_type,
+                        qty,
+                        unit_cost,
+                        ref_type,
+                        ref_id,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        product["id"],
+                        invoice_type,
+                        movement_qty,
+                        movement_cost,
+                        "invoice",
+                        invoice_id,
+                        now(),
+                    ),
+                )
+
+            journal_cursor = connection.execute(
+                """
+                INSERT INTO journal_entries
+                (
+                    ref_type,
+                    ref_id,
+                    description,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    invoice_type,
+                    invoice_id,
+                    (
+                        "ثبت فاکتور فروش"
+                        if invoice_type == "sale"
+                        else "ثبت فاکتور خرید"
+                    ),
+                    now(),
+                ),
+            )
+
+            journal_id = journal_cursor.lastrowid
+
+            if invoice_type == "sale":
+
+                journal_lines = sale_entry_lines(
+                    total,
+                    total_cost,
+                    payment_method,
+                )
+
+            else:
+
+                journal_lines = purchase_entry_lines(
+                    total,
+                    payment_method,
+                )
+
+            for (
+                account_code,
+                debit,
+                credit,
+            ) in journal_lines:
+
+                connection.execute(
+                    """
+                    INSERT INTO journal_lines
+                    (
+                        journal_id,
+                        account_code,
+                        debit,
+                        credit
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        journal_id,
+                        account_code,
+                        debit,
+                        credit,
+                    ),
+                )
+
+            connection.commit()
+
+            return (
+                invoice_id,
+                invoice_no,
+                total,
+                total_cost,
+            )
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
+
 
 def get_invoice(invoice_id):
-    conn = get_connection()
 
-    invoice = conn.execute(
-        """
-        SELECT
-            i.*,
-            c.name AS customer_name,
-            s.name AS supplier_name
-        FROM invoices i
-        LEFT JOIN customers c ON c.id=i.customer_id
-        LEFT JOIN suppliers s ON s.id=i.supplier_id
-        WHERE i.id=?
-        """,
-        (invoice_id,),
-    ).fetchone()
+    with get_connection() as connection:
 
-    items = conn.execute(
-        """
-        SELECT
-            ii.*,
-            p.name AS product_name,
-            p.code AS product_code,
-            p.unit
-        FROM invoice_items ii
-        JOIN products p ON p.id=ii.product_id
-        WHERE ii.invoice_id=?
-        ORDER BY ii.id
-        """,
-        (invoice_id,),
-    ).fetchall()
-
-    conn.close()
-
-    return {
-        "invoice": invoice,
-        "items": items,
-    }
-
-
-def list_invoices(invoice_type=None, limit=20):
-    conn = get_connection()
-
-    if invoice_type:
-        rows = conn.execute(
+        invoice = connection.execute(
             """
             SELECT
                 i.*,
                 c.name AS customer_name,
                 s.name AS supplier_name
             FROM invoices i
-            LEFT JOIN customers c ON c.id=i.customer_id
-            LEFT JOIN suppliers s ON s.id=i.supplier_id
-            WHERE i.invoice_type=?
-            ORDER BY i.id DESC
-            LIMIT ?
+
+            LEFT JOIN customers c
+                ON c.id=i.customer_id
+
+            LEFT JOIN suppliers s
+                ON s.id=i.supplier_id
+
+            WHERE i.id=?
             """,
-            (invoice_type, limit),
+            (
+                invoice_id,
+            ),
+        ).fetchone()
+
+        if not invoice:
+            return None, []
+
+        items = connection.execute(
+            """
+            SELECT
+                ii.*,
+                p.code,
+                p.name,
+                p.unit
+            FROM invoice_items ii
+
+            JOIN products p
+                ON p.id=ii.product_id
+
+            WHERE ii.invoice_id=?
+            ORDER BY ii.id
+            """,
+            (
+                invoice_id,
+            ),
         ).fetchall()
-    else:
-        rows = conn.execute(
+
+        return invoice, items
+
+
+def list_invoices(limit=20):
+
+    with get_connection() as connection:
+
+        return connection.execute(
             """
             SELECT
                 i.*,
                 c.name AS customer_name,
                 s.name AS supplier_name
             FROM invoices i
-            LEFT JOIN customers c ON c.id=i.customer_id
-            LEFT JOIN suppliers s ON s.id=i.supplier_id
+
+            LEFT JOIN customers c
+                ON c.id=i.customer_id
+
+            LEFT JOIN suppliers s
+                ON s.id=i.supplier_id
+
             ORDER BY i.id DESC
             LIMIT ?
             """,
-            (limit,),
+            (
+                limit,
+            ),
         ).fetchall()
 
-    conn.close()
-    return rows
+
+# =========================================================
+# STOCK / REPORTS
+# =========================================================
+
+def stock_report():
+
+    with get_connection() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE active=1
+            ORDER BY name
+            """
+        ).fetchall()
 
 
-def get_stock_report():
-    conn = get_connection()
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM products
-        WHERE active=1
-        ORDER BY name
-        """
-    ).fetchall()
-    conn.close()
-    return rows
+def low_stock():
+
+    with get_connection() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE active=1
+            AND stock <= min_stock
+            ORDER BY stock
+            """
+        ).fetchall()
 
 
-def get_low_stock_products():
-    conn = get_connection()
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM products
-        WHERE active=1
-          AND stock <= min_stock
-        ORDER BY stock ASC
-        """
-    ).fetchall()
-    conn.close()
-    return rows
+def sales_summary():
+
+    with get_connection() as connection:
+
+        return connection.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                COALESCE(
+                    SUM(total),
+                    0
+                ) AS total
+            FROM invoices
+            WHERE invoice_type='sale'
+            AND status='confirmed'
+            """
+        ).fetchone()
 
 
-def get_last_journal_for_invoice(invoice_id):
-    conn = get_connection()
+def purchase_summary():
 
-    entry = conn.execute(
-        """
-        SELECT *
-        FROM journal_entries
-        WHERE reference_id=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (invoice_id,),
-    ).fetchone()
+    with get_connection() as connection:
 
-    if not entry:
-        conn.close()
-        return None, []
-
-    lines = conn.execute(
-        """
-        SELECT *
-        FROM journal_lines
-        WHERE journal_entry_id=?
-        ORDER BY id
-        """,
-        (entry["id"],),
-    ).fetchall()
-
-    conn.close()
-
-    return entry, lines
+        return connection.execute(
+            """
+            SELECT
+                COUNT(*) AS n,
+                COALESCE(
+                    SUM(total),
+                    0
+                ) AS total
+            FROM invoices
+            WHERE invoice_type='purchase'
+            AND status='confirmed'
+            """
+        ).fetchone()
 
 
-# -------------------------
-# Subscription
-# -------------------------
+# =========================================================
+# EXPENSES
+# =========================================================
 
-def create_subscription_payment(
-    telegram_user_id,
+def add_expense(
+    title,
+    amount,
+    payment_method,
+    note="",
+):
+
+    with get_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO expenses
+            (
+                title,
+                amount,
+                payment_method,
+                note,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                amount,
+                payment_method,
+                note,
+                now(),
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+# =========================================================
+# SUBSCRIPTIONS
+# =========================================================
+
+def create_payment(
+    telegram_id,
     plan_code,
     plan_name,
     amount,
 ):
-    with db_transaction() as conn:
-        cur = conn.execute(
+
+    user = get_user(
+        telegram_id
+    )
+
+    if not user:
+        raise ValueError(
+            "کاربر ثبت نشده است."
+        )
+
+    with get_connection() as connection:
+
+        cursor = connection.execute(
             """
             INSERT INTO subscription_payments
-            (telegram_user_id, plan_code, plan_name,
-             amount, status, submitted_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
-            """,
             (
                 telegram_user_id,
+                plan_code,
+                plan_name,
+                amount,
+                submitted_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
                 plan_code,
                 plan_name,
                 amount,
                 now(),
             ),
         )
-        return cur.lastrowid
 
-
-def attach_receipt_to_payment(
-    payment_id,
-    receipt_file_id,
-    receipt_file_unique_id=None,
-):
-    with db_transaction() as conn:
-        conn.execute(
-            """
-            UPDATE subscription_payments
-            SET receipt_file_id=?,
-                receipt_file_unique_id=?,
-                status='pending'
-            WHERE id=?
-            """,
-            (
-                receipt_file_id,
-                receipt_file_unique_id,
-                payment_id,
-            ),
-        )
+        return cursor.lastrowid
 
 
 def get_payment(payment_id):
-    conn = get_connection()
 
-    row = conn.execute(
-        """
-        SELECT
-            p.*,
-            u.telegram_id,
-            u.username,
-            u.first_name,
-            u.last_name
-        FROM subscription_payments p
-        JOIN telegram_users u
-          ON u.id=p.telegram_user_id
-        WHERE p.id=?
-        """,
-        (payment_id,),
-    ).fetchone()
+    with get_connection() as connection:
 
-    conn.close()
-    return row
-
-
-def get_pending_payments():
-    conn = get_connection()
-
-    rows = conn.execute(
-        """
-        SELECT
-            p.*,
-            u.telegram_id,
-            u.username,
-            u.first_name,
-            u.last_name
-        FROM subscription_payments p
-        JOIN telegram_users u
-          ON u.id=p.telegram_user_id
-        WHERE p.status='pending'
-        ORDER BY p.id DESC
-        """
-    ).fetchall()
-
-    conn.close()
-    return rows
-
-
-def approve_subscription_payment(
-    payment_id,
-    reviewed_by,
-    start_date=None,
-    end_date=None,
-):
-    payment = get_payment(payment_id)
-
-    if not payment:
-        return None
-
-    if payment["status"] == "approved":
-        return get_active_subscription(payment["telegram_user_id"])
-
-    if start_date is None:
-        start_date = date.today()
-
-    if end_date is None:
-        end_date = start_date
-
-    with db_transaction() as conn:
-        existing = conn.execute(
+        return connection.execute(
             """
-            SELECT *
-            FROM subscriptions
-            WHERE telegram_user_id=?
-              AND status='active'
-            ORDER BY end_date DESC
-            LIMIT 1
+            SELECT
+                p.*,
+                u.telegram_id,
+                u.username,
+                u.first_name,
+                u.last_name
+            FROM subscription_payments p
+
+            JOIN telegram_users u
+                ON u.id=p.telegram_user_id
+
+            WHERE p.id=?
             """,
-            (payment["telegram_user_id"],),
+            (
+                payment_id,
+            ),
         ).fetchone()
 
-        actual_start = start_date
-        actual_end = end_date
 
-        if existing and existing["end_date"]:
-            try:
-                old_end = date.fromisoformat(existing["end_date"])
+def attach_receipt(
+    payment_id,
+    file_id,
+    unique_id,
+):
 
-                if old_end >= start_date:
-                    actual_start = old_end
-                    duration = end_date - start_date
-                    actual_end = old_end + duration
-            except ValueError:
-                pass
+    with get_connection() as connection:
 
-        conn.execute(
+        connection.execute(
             """
             UPDATE subscription_payments
-            SET status='approved',
-                reviewed_at=?,
-                reviewed_by=?
+
+            SET
+                receipt_file_id=?,
+                receipt_file_unique_id=?
+
             WHERE id=?
             """,
             (
-                now(),
-                reviewed_by,
+                file_id,
+                unique_id,
                 payment_id,
             ),
         )
 
-        conn.execute(
+
+def pending_payments():
+
+    with get_connection() as connection:
+
+        return connection.execute(
             """
-            UPDATE subscriptions
-            SET status='inactive',
-                updated_at=?
+            SELECT
+                p.*,
+                u.telegram_id,
+                u.username,
+                u.first_name,
+                u.last_name
+            FROM subscription_payments p
+
+            JOIN telegram_users u
+                ON u.id=p.telegram_user_id
+
+            WHERE p.status='pending'
+
+            ORDER BY p.id
+            """
+        ).fetchall()
+
+
+def approve_payment(
+    payment_id,
+    reviewer_id,
+    duration_days,
+):
+
+    with get_connection() as connection:
+
+        payment = connection.execute(
+            """
+            SELECT *
+            FROM subscription_payments
+            WHERE id=?
+            AND status='pending'
+            """,
+            (
+                payment_id,
+            ),
+        ).fetchone()
+
+        if not payment:
+            return None
+
+        today = date.today()
+
+        active_subscription = connection.execute(
+            """
+            SELECT *
+            FROM subscriptions
+
             WHERE telegram_user_id=?
-              AND status='active'
+
+            AND status='active'
+
+            AND end_date>=?
+
+            ORDER BY end_date DESC
+
+            LIMIT 1
+            """,
+            (
+                payment["telegram_user_id"],
+                today.isoformat(),
+            ),
+        ).fetchone()
+
+        if active_subscription:
+
+            start_date = (
+                date.fromisoformat(
+                    active_subscription[
+                        "end_date"
+                    ]
+                )
+                + timedelta(days=1)
+            )
+
+        else:
+
+            start_date = today
+
+        end_date = (
+            start_date
+            + timedelta(
+                days=duration_days - 1
+            )
+        )
+
+        connection.execute(
+            """
+            UPDATE subscription_payments
+
+            SET
+                status='approved',
+                reviewed_at=?,
+                reviewed_by=?
+
+            WHERE id=?
             """,
             (
                 now(),
-                payment["telegram_user_id"],
+                reviewer_id,
+                payment_id,
             ),
         )
 
-        conn.execute(
+        cursor = connection.execute(
             """
             INSERT INTO subscriptions
-            (telegram_user_id, plan_code, plan_name,
-             start_date, end_date, status,
-             payment_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            (
+                telegram_user_id,
+                plan_code,
+                plan_name,
+                start_date,
+                end_date,
+                status,
+                payment_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment["telegram_user_id"],
                 payment["plan_code"],
                 payment["plan_name"],
-                actual_start.isoformat(),
-                actual_end.isoformat(),
+                start_date.isoformat(),
+                end_date.isoformat(),
+                "active",
                 payment_id,
-                now(),
                 now(),
             ),
         )
 
-    return get_active_subscription(payment["telegram_user_id"])
+        return {
+            "subscription_id": cursor.lastrowid,
+            "telegram_id": payment[
+                "telegram_user_id"
+            ],
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "plan_name": payment["plan_name"],
+        }
 
 
-def reject_subscription_payment(
+def reject_payment(
     payment_id,
-    reviewed_by,
+    reviewer_id,
     reason="",
 ):
-    with db_transaction() as conn:
-        conn.execute(
+
+    with get_connection() as connection:
+
+        result = connection.execute(
             """
             UPDATE subscription_payments
-            SET status='rejected',
+
+            SET
+                status='rejected',
                 reviewed_at=?,
                 reviewed_by=?,
                 rejection_reason=?
+
             WHERE id=?
+            AND status='pending'
             """,
             (
                 now(),
-                reviewed_by,
+                reviewer_id,
                 reason,
                 payment_id,
             ),
         )
 
+        return result.rowcount > 0
 
-def deactivate_expired_subscriptions():
-    with db_transaction() as conn:
-        conn.execute(
+
+def active_subscription(
+    telegram_id,
+):
+
+    with get_connection() as connection:
+
+        return connection.execute(
             """
-            UPDATE subscriptions
-            SET status='expired',
-                updated_at=?
-            WHERE status='active'
-              AND end_date < ?
+            SELECT
+                s.*
+            FROM subscriptions s
+
+            JOIN telegram_users u
+                ON u.id=s.telegram_user_id
+
+            WHERE u.telegram_id=?
+
+            AND s.status='active'
+
+            AND s.end_date>=?
+
+            ORDER BY s.end_date DESC
+
+            LIMIT 1
             """,
             (
-                now(),
+                telegram_id,
                 date.today().isoformat(),
             ),
-        )
-
-
-def get_active_subscription(telegram_id):
-    deactivate_expired_subscriptions()
-
-    conn = get_connection()
-
-    row = conn.execute(
-        """
-        SELECT s.*
-        FROM subscriptions s
-        JOIN telegram_users u
-          ON u.id=s.telegram_user_id
-        WHERE u.telegram_id=?
-          AND s.status='active'
-        ORDER BY s.end_date DESC
-        LIMIT 1
-        """,
-        (telegram_id,),
-    ).fetchone()
-
-    conn.close()
-    return row
-
-
-def get_subscription_status(telegram_id):
-    subscription = get_active_subscription(telegram_id)
-
-    if not subscription:
-        return {
-            "active": False,
-            "subscription": None,
-            "remaining_days": 0,
-        }
-
-    try:
-        end_date = date.fromisoformat(
-            subscription["end_date"]
-        )
-        remaining = max(
-            0,
-            (end_date - date.today()).days + 1,
-        )
-    except Exception:
-        remaining = 0
-
-    return {
-        "active": True,
-        "subscription": subscription,
-        "remaining_days": remaining,
-    }
+        ).fetchone()
